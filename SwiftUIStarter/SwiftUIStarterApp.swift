@@ -17,4 +17,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         self.window = window
         return true
     }
+
+    /// 强制横屏：网页套壳始终以横屏显示（scratch-gui 编辑器为宽屏布局）。
+    func application(
+        _ application: UIApplication,
+        supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        return [.landscapeLeft, .landscapeRight]
+    }
 }
