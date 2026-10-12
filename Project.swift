@@ -24,7 +24,7 @@ let project = Project(
             deploymentTargets: deploymentTargets,
             infoPlist: .file(path: "SwiftUIStarter/Info.plist"),
             sources: ["SwiftUIStarter/**/*.swift"],
-            resources: ["SwiftUIStarter/Assets.xcassets"]
+            resources: ["SwiftUIStarter/Assets.xcassets", "SwiftUIStarter/scratchgui"]
         )
     ]
 )
