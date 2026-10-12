@@ -9,6 +9,11 @@ import MobileCoreServices
 ///
 /// 为兼容 iOS 13：以单例持有实例（避免 @StateObject 不可用导致反复重建），
 /// 文件选择使用 UIDocumentPickerViewController（UIViewControllerRepresentable 包装）。
+///
+/// 关键稳定性修正（针对 iPhone 7 / 老设备启动闪退）：
+/// - WKWebView 仅创建一次，避免复用 WKWebViewConfiguration 引发异常崩溃。
+/// - index.html 查找多重回退，失败不再 fatalError，而是弹错误提示。
+/// - 非持久化 websiteDataStore，降低内存/磁盘占用。
 final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate {
 
     /// 单例：iOS 13 无 @StateObject，用单例保证实例稳定、状态不丢失。
@@ -22,48 +27,81 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     // MARK: - 私有资源路径
 
-    let configuration: WKWebViewConfiguration
-    private(set) var indexURL: URL!
-    private(set) var scratchDir: URL!
-    private weak var webView: WKWebView?
+    private(set) var webView: WKWebView?
+    private var indexURL: URL?
+    private var scratchDir: URL?
 
     // MARK: - 初始化
 
     override private init() {
-        let bundle = Bundle.main
-        // 用递归查找避免 Tuist 打包后目录结构差异；scratchgui 资源目录内必有 index.html
-        let htmlPaths = bundle.paths(forResourcesOfType: "html", inDirectory: nil)
-        guard let index = htmlPaths.first(where: { $0.contains("scratchgui") && $0.hasSuffix("index.html") }) else {
-            fatalError("未找到 scratchgui/index.html，请确认已将 scratch-gui 构建产物复制到 SwiftUIStarter/scratchgui")
-        }
-        let dir = URL(fileURLWithPath: index).deletingLastPathComponent()
-        indexURL = URL(fileURLWithPath: index)
-        scratchDir = dir
-
-        configuration = WKWebViewConfiguration()
         super.init()
-
-        // 注入桥接脚本：拦截 blob 下载并上报原生
-        let script = WKUserScript(
-            source: ScratchBridge.bridgeJS,
-            injectionTime: .atDocumentEnd,
-            forMainFrameOnly: false
-        )
-        configuration.userContentController.addUserScript(script)
-        configuration.userContentController.add(self, name: "scratchSave")
-        configuration.preferences.javaScriptEnabled = true
+        // 资源解析与 WKWebView 创建延迟到 makeWebView()（首次由 SwiftUI 触发），
+        // 避免单例构造阶段做任何可能失败的重操作。
     }
 
     // MARK: - WebView 创建与加载
 
+    /// 返回唯一的 WKWebView 实例：首次调用时创建并加载，后续调用直接复用，
+    /// 从根本上杜绝“同一 WKWebViewConfiguration 被多次初始化 WKWebView”导致的崩溃。
     func makeWebView() -> WKWebView {
+        if let existing = webView { return existing }
+
+        guard let indexURL = ScratchBridge.resolveIndexURL() else {
+            let msg = "未在 App 资源中找到 scratch-gui 的 index.html，请确认构建已包含 scratchgui 目录（Tuist 资源未正确打包）。"
+            DispatchQueue.main.async { [weak self] in
+                self?.errorMessage = msg
+                self?.showError = true
+            }
+            let fallback = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+            webView = fallback
+            return fallback
+        }
+
+        self.indexURL = indexURL
+        self.scratchDir = indexURL.deletingLastPathComponent()
+
+        let configuration = WKWebViewConfiguration()
+        configuration.preferences.javaScriptEnabled = true
+        // 非持久化数据仓储：减少磁盘与内存占用，对 2GB 内存的老设备（iPhone 7）更友好。
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: ScratchBridge.bridgeJS,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: false
+            )
+        )
+        configuration.userContentController.add(self, name: "scratchSave")
+
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.allowsBackForwardNavigationGestures = false
         webView.scrollView.bounces = false
         self.webView = webView
-        webView.loadFileURL(indexURL, allowingReadAccessTo: scratchDir)
+        webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
         return webView
+    }
+
+    /// 健壮查找 scratch-gui 的 index.html：
+    /// 1) 优先按子目录 scratchgui 直接定位；
+    /// 2) 否则扫描所有 index.html，挑选父目录含 scratch 标志性文件（player.html/editor.html/static 等）的那个；
+    /// 3) 仍无则取首个 index.html。
+    private static func resolveIndexURL() -> URL? {
+        let bundle = Bundle.main
+        if let url = bundle.url(forResource: "index", withExtension: "html", subdirectory: "scratchgui") {
+            return url
+        }
+        let candidates = (bundle.urls(forResourcesWithExtension: "html", subdirectory: nil) ?? [])
+            .filter { $0.lastPathComponent == "index.html" }
+        let markers = ["player.html", "editor.html", "static", "addons.html", "credits.html", "sa.html"]
+        for marker in markers {
+            if let found = candidates.first(where: {
+                FileManager.default.fileExists(atPath: $0.deletingLastPathComponent().appendingPathComponent(marker).path)
+            }) {
+                return found
+            }
+        }
+        return candidates.first
     }
 
     // MARK: - 原生打开 .sb3
@@ -72,6 +110,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     /// scratch-gui 的编辑器仅从 URL 读取 project_url（支持 http/https/data 三种 scheme），
     /// 因此用 `data:application/octet-stream;base64,<内容>` 直接传入，无需本地 HTTP server。
     func openProject(data: Data) {
+        guard let indexURL = indexURL, let scratchDir = scratchDir else { return }
         let base64 = data.base64EncodedString()
         let dataURL = "data:application/octet-stream;base64," + base64
         guard var components = URLComponents(url: indexURL, resolvingAgainstBaseURL: false) else { return }
@@ -94,6 +133,23 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
             return
         }
         saveProject(name: name, base64: base64)
+    }
+
+    // MARK: - WKNavigationDelegate（加载错误兜底）
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        reportLoadError(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        reportLoadError(error)
+    }
+
+    private func reportLoadError(_ error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            self?.errorMessage = "页面加载失败：\(error.localizedDescription)"
+            self?.showError = true
+        }
     }
 
     // MARK: - 保存文件到本地
@@ -190,7 +246,7 @@ struct ScratchWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        // 初始加载已在 makeUIView 中触发，此处无需处理
+        // WKWebView 由单例唯一持有，初始加载已在 makeUIView 中触发，此处无需处理。
     }
 }
 
