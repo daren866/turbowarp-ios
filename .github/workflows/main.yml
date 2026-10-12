@@ -1,8 +1,8 @@
-name: Build Unsigned IPA for TrollStore (iOS 15+ arm64)
+name: Build Unsigned IPA (GudaoCode, iOS 13+ arm64)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -17,31 +17,22 @@ jobs:
       with:
         xcode-version: 'latest'
 
-    - name: Install Tuist via Homebrew
+    - name: Install Tuist
       run: |
         brew update
         brew install tuist
         tuist version
 
-    - name: Generate Project with Tuist (iOS 15.0)
-      run: |
-        # 在生成项目时设置部署目标（如果 Tuist 支持）
-        # 或者通过环境变量影响 Tuist 的生成
-        export IPHONEOS_DEPLOYMENT_TARGET=15.0
-        tuist generate --no-open
-        ls -la *.xcodeproj || echo "检查项目文件"
+    - name: Generate Xcode project
+      run: tuist generate --no-open
 
-    - name: Build Xcode Archive (arm64 only)
+    - name: Build archive (unsigned, arm64, iOS 13.0)
       run: |
+        set -e
         PROJECT_FILE=$(find . -maxdepth 1 -name "*.xcodeproj" | head -1)
         PROJECT_NAME=$(basename "$PROJECT_FILE" .xcodeproj)
-        
         SCHEME_NAME="$PROJECT_NAME"
-        
-        # 关键修改点：
-        # 1. 设置仅构建 arm64 架构
-        # 2. 设置 iOS 15.0 最低部署目标
-        # 3. 显式排除 arm64e 等非标准架构
+        echo "Project: $PROJECT_NAME, Scheme: $SCHEME_NAME"
         xcodebuild clean archive \
           -project "$PROJECT_NAME.xcodeproj" \
           -scheme "$SCHEME_NAME" \
@@ -49,94 +40,47 @@ jobs:
           -archivePath "$PWD/build/$PROJECT_NAME.xcarchive" \
           CODE_SIGN_IDENTITY="" \
           CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO \
           -destination generic/platform=iOS \
           ENABLE_BITCODE=NO \
           ARCHS=arm64 \
           ONLY_ACTIVE_ARCH=NO \
-          IPHONEOS_DEPLOYMENT_TARGET=15.0 \
-          VALID_ARCHS=arm64
+          IPHONEOS_DEPLOYMENT_TARGET=13.0
 
-    - name: Verify Binary Architecture
-      run: |
-        PROJECT_FILE=$(find . -maxdepth 1 -name "*.xcodeproj" | head -1)
-        PROJECT_NAME=$(basename "$PROJECT_FILE" .xcodeproj)
-        ARCHIVE_PATH="$PWD/build/$PROJECT_NAME.xcarchive"
-        APP_BUNDLE=$(find "$ARCHIVE_PATH/Products/Applications" -name "*.app" -type d | head -1)
-        if [ -z "$APP_BUNDLE" ]; then
-          echo "错误：未找到 .app 包"
-          exit 1
-        fi
-        APP_NAME=$(basename "$APP_BUNDLE" .app)
-        APP_BINARY="$APP_BUNDLE/$APP_NAME"
-        
-        echo "🔍 验证二进制架构:"
-        # 检查是否为纯 arm64 架构
-        lipo -info "$APP_BINARY"
-        # 详细架构信息
-        echo "架构详情:"
-        file "$APP_BINARY"
-        # 检查 Mach-O 信息
-        otool -hv "$APP_BINARY" | head -20
-
-    - name: Package & Fix IPA for TrollStore
+    - name: Package unsigned IPA
       id: package_ipa
       run: |
+        set -e
         PROJECT_FILE=$(find . -maxdepth 1 -name "*.xcodeproj" | head -1)
         PROJECT_NAME=$(basename "$PROJECT_FILE" .xcodeproj)
         ARCHIVE_PATH="$PWD/build/$PROJECT_NAME.xcarchive"
-        
-        # 查找 .app 包
         APP_BUNDLE=$(find "$ARCHIVE_PATH/Products/Applications" -name "*.app" -type d | head -1)
         if [ -z "$APP_BUNDLE" ]; then
           echo "错误：未找到 .app 包"
           exit 1
         fi
-        
         APP_NAME=$(basename "$APP_BUNDLE" .app)
-        APP_BINARY="$APP_BUNDLE/$APP_NAME"
-        
-        echo "处理应用: $APP_NAME"
-        echo "二进制路径: $APP_BINARY"
-        
-        # 检查并修复 Info.plist 中的最小版本
+
+        # 确保最小系统版本为 13.0（与工程部署目标一致）
         INFO_PLIST="$APP_BUNDLE/Info.plist"
         if [ -f "$INFO_PLIST" ]; then
-          echo "当前最小系统版本:"
-          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$INFO_PLIST" 2>/dev/null || echo "未找到 MinimumOSVersion 键"
-          
-          # 设置为 iOS 15.0
-          echo "设置最小系统版本为 15.0..."
-          /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion 15.0" "$INFO_PLIST" 2>/dev/null || \
-          /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 15.0" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion 13.0" "$INFO_PLIST" 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 13.0" "$INFO_PLIST"
         fi
-        
-        # 关键修复 1: 确保可执行权限
-        echo "➡️ 修复可执行权限..."
-        chmod +x "$APP_BINARY"
-        
-        # 关键修复 2: 为 TrollStore 进行伪签名
-        echo "➡️ 为 TrollStore 注入权限..."
-        brew install ldid
-        ldid -S "$APP_BINARY"
-        
-        # 验证
-        echo "✅ 修复完成。最终权限："
-        ls -l "$APP_BINARY"
-        
-        # 打包
+
+        chmod +x "$APP_BUNDLE/$APP_NAME"
+
         IPA_DIR="$PWD/build/ipa"
         mkdir -p "$IPA_DIR/Payload"
         cp -R "$APP_BUNDLE" "$IPA_DIR/Payload/"
         cd "$IPA_DIR"
-        IPA_NAME="${PROJECT_NAME}_iOS15_arm64_TrollStore.ipa"
+        IPA_NAME="${PROJECT_NAME}_iOS13_arm64.ipa"
         zip -r "../$IPA_NAME" Payload
-        
-        # 设置输出供后续步骤使用
-        echo "ipa_name=$IPA_NAME" >> $GITHUB_OUTPUT
+        echo "ipa_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
 
-    - name: Upload TrollStore IPA
+    - name: Upload IPA
       uses: actions/upload-artifact@v4
       with:
-        name: trollstore-ipa-ios15-arm64
-        path: ${{ github.workspace }}/build/*_TrollStore.ipa
-        retention-days: 7
+        name: gudaocode-unsigned-ipa
+        path: ${{ github.workspace }}/build/*_iOS13_arm64.ipa
+        retention-days: 30

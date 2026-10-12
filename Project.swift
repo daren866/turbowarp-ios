@@ -1,10 +1,10 @@
 import ProjectDescription
 
-let deploymentTargets: DeploymentTargets = .iOS("17.0")
+let deploymentTargets: DeploymentTargets = .iOS("13.0")
 
 let project = Project(
-    name: "SwiftUIStarter",
-    organizationName: "Example",
+    name: "GudaoCode",
+    organizationName: "Gudao",
     settings: .settings(
         base: [
             "DEVELOPMENT_TEAM": "<YOUR_DEVELOPMENT_TEAM_ID>",
@@ -17,10 +17,10 @@ let project = Project(
     ),
     targets: [
         .target(
-            name: "SwiftUIStarter",
+            name: "GudaoCode",
             destinations: .iOS,
             product: .app,
-            bundleId: "com.example.SwiftUIStarter",
+            bundleId: "com.gudao.scratch",
             deploymentTargets: deploymentTargets,
             infoPlist: .file(path: "SwiftUIStarter/Info.plist"),
             sources: ["SwiftUIStarter/**/*.swift"],

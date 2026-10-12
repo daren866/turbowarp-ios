@@ -1,11 +1,18 @@
 import SwiftUI
 import WebKit
-import UniformTypeIdentifiers
+import UIKit
+import MobileCoreServices
 
 /// 桥接 scratch-gui（Web 编辑器）与 iOS 原生层。
 /// - 保存：拦截编辑器“保存到设备”的 blob 下载，写入 App Documents/ScratchProjects。
-/// - 打开：提供原生文件选择器，读入 .sb3 后经 project_data 参数载入编辑器。
+/// - 打开：提供原生文件选择器，读入 .sb3 后经 project_url(data:) 参数载入编辑器。
+///
+/// 为兼容 iOS 13：以单例持有实例（避免 @StateObject 不可用导致反复重建），
+/// 文件选择使用 UIDocumentPickerViewController（UIViewControllerRepresentable 包装）。
 final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate {
+
+    /// 单例：iOS 13 无 @StateObject，用单例保证实例稳定、状态不丢失。
+    static let shared = ScratchBridge()
 
     // MARK: - 对外状态（驱动 SwiftUI 弹窗）
 
@@ -22,7 +29,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     // MARK: - 初始化
 
-    override init() {
+    override private init() {
         let bundle = Bundle.main
         // 用递归查找避免 Tuist 打包后目录结构差异；scratchgui 资源目录内必有 index.html
         let htmlPaths = bundle.paths(forResourcesOfType: "html", inDirectory: nil)
@@ -61,7 +68,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     // MARK: - 原生打开 .sb3
 
-    /// 由 SwiftUI 文件选择器调用：读入 .sb3 数据，包成 data: URL 后经 project_url 参数载入编辑器。
+    /// 由文件选择器调用：读入 .sb3 数据，包成 data: URL 后经 project_url 参数载入编辑器。
     /// scratch-gui 的编辑器仅从 URL 读取 project_url（支持 http/https/data 三种 scheme），
     /// 因此用 `data:application/octet-stream;base64,<内容>` 直接传入，无需本地 HTTP server。
     func openProject(data: Data) {
@@ -146,6 +153,33 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     """
 }
 
+// MARK: - UIDocumentPickerViewController 包装（iOS 13 可用的文件选择器）
+
+struct DocumentPicker: UIViewControllerRepresentable {
+    let onPick: (URL) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        // kUTTypeData 允许选择任意数据文件（含 .sb3）
+        let picker = UIDocumentPickerViewController(documentTypes: [kUTTypeData as String], in: .open)
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: (URL) -> Void
+        init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first { onPick(url) }
+        }
+    }
+}
+
 // MARK: - UIViewRepresentable 包装 WKWebView
 
 struct ScratchWebView: UIViewRepresentable {
@@ -160,57 +194,61 @@ struct ScratchWebView: UIViewRepresentable {
     }
 }
 
-// MARK: - SwiftUI 入口视图
+// MARK: - SwiftUI 入口视图（iOS 13 兼容）
 
 struct ScratchGUIView: View {
-    @StateObject private var bridge = ScratchBridge()
+    @ObservedObject private var bridge = ScratchBridge.shared
     @State private var showPicker = false
 
     var body: some View {
-        ScratchWebView(bridge: bridge)
-            .ignoresSafeArea()
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showPicker = true
-                    } label: {
-                        Label("从本地打开", systemImage: "folder.badge.plus")
-                    }
+        ZStack(alignment: .topTrailing) {
+            ScratchWebView(bridge: bridge)
+                .edgesIgnoringSafeArea(.all)
+
+            // 浮动“打开”按钮：避免 iOS 13 无 .toolbar 时无法放置原生入口，
+            // 同时不与 scratch 自带顶部菜单栏（导航栏）层叠。
+            Button(action: { showPicker = true }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "folder")
+                    Text("打开")
+                }
+                .font(.system(size: 14, weight: .medium))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.55))
+                .foregroundColor(.white)
+                .cornerRadius(8)
+            }
+            .padding(.top, 6)
+            .padding(.trailing, 8)
+        }
+        .sheet(isPresented: $showPicker) {
+            DocumentPicker { url in
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                if let data = try? Data(contentsOf: url) {
+                    bridge.openProject(data: data)
                 }
             }
-            .fileImporter(
-                isPresented: $showPicker,
-                allowedContentTypes: [UTType(filenameExtension: "sb3") ?? .data],
-                allowsMultipleSelection: false
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    guard let url = urls.first else { return }
-                    let accessed = url.startAccessingSecurityScopedResource()
-                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                    if let data = try? Data(contentsOf: url) {
-                        bridge.openProject(data: data)
-                    }
-                case .failure(let error):
-                    bridge.errorMessage = error.localizedDescription
-                    bridge.showError = true
-                }
-            }
-            .alert(
-                "已保存",
-                isPresented: Binding(
-                    get: { bridge.savedMessage != nil },
-                    set: { if !$0 { bridge.savedMessage = nil } }
-                )
-            ) {
-                Button("好", role: .cancel) {}
-            } message: {
-                Text(bridge.savedMessage ?? "")
-            }
-            .alert("错误", isPresented: $bridge.showError) {
-                Button("好", role: .cancel) {}
-            } message: {
-                Text(bridge.errorMessage)
-            }
+        }
+        .alert(
+            isPresented: Binding(
+                get: { bridge.savedMessage != nil },
+                set: { if !$0 { bridge.savedMessage = nil } }
+            )
+        ) {
+            Alert(
+                title: Text("已保存"),
+                message: Text(bridge.savedMessage ?? ""),
+                dismissButton: .default(Text("好"))
+            )
+        }
+        .alert(isPresented: $bridge.showError) {
+            Alert(
+                title: Text("错误"),
+                message: Text(bridge.errorMessage),
+                dismissButton: .default(Text("好"))
+            )
+        }
     }
 }
