@@ -3,7 +3,7 @@ import WebKit
 import UIKit
 
 /// 桥接 scratch-gui（Web 编辑器）与 iOS 原生层。
-/// - 保存：拦截编辑器“保存到设备”的 blob 下载，写入 App Documents/ScratchProjects。
+/// - 保存：拦截编辑器“保存到电脑”的 blob 下载，写入 App Documents/ScratchProjects。
 /// - 打开：底层 openProject(data:) 可将 .sb3 经 project_url(data:) 参数载入编辑器
 ///   （由编辑器自身 UI 触发，不再使用额外原生浮层按钮）。
 ///
@@ -18,11 +18,11 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     /// 单例：iOS 13 无 @StateObject，用单例保证实例稳定、状态不丢失。
     static let shared = ScratchBridge()
 
-    // MARK: - 对外状态（驱动 SwiftUI 弹窗）
+    // MARK: - 对外状态（驱动 SwiftUI 顶部 Toast）
 
-    @Published var savedMessage: String?
-    @Published var showError = false
-    @Published var errorMessage = ""
+    /// 顶部 Toast 提示：toastMessage 为空则不显示；toastIsError 决定绿（成功）/红（错误）。
+    @Published var toastMessage: String?
+    @Published var toastIsError = false
 
     // MARK: - 私有资源路径
 
@@ -38,6 +38,24 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         // 避免单例构造阶段做任何可能失败的重操作。
     }
 
+    // MARK: - Toast 显示
+
+    /// 显示顶部 Toast：成功（绿）/错误（红），展示后自动消失。
+    /// - 成功提示展示 1.5 秒；错误提示文本较长，展示 2.5 秒以便阅读。
+    private func showToast(_ message: String, isError: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.toastMessage = message
+            self?.toastIsError = isError
+            let duration: TimeInterval = isError ? 2.5 : 1.5
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+                // 仅当仍是本条提示时才清除，避免覆盖更新的提示。
+                if self?.toastMessage == message {
+                    self?.toastMessage = nil
+                }
+            }
+        }
+    }
+
     // MARK: - WebView 创建与加载
 
     /// 返回唯一的 WKWebView 实例：首次调用时创建并加载，后续调用直接复用，
@@ -47,10 +65,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
         guard let indexURL = ScratchBridge.resolveIndexURL() else {
             let msg = "未在 App 资源中找到 scratch-gui 的 index.html，请确认构建已包含 scratchgui 目录（Tuist 资源未正确打包）。"
-            DispatchQueue.main.async { [weak self] in
-                self?.errorMessage = msg
-                self?.showError = true
-            }
+            showToast(msg, isError: true)
             let fallback = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
             webView = fallback
             return fallback
@@ -147,43 +162,49 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     /// 网页内容进程被系统终止（老设备 2GB 内存跑重型编辑器时常因内存压力被 jetsam 杀掉）。
     /// 捕获后给出明确提示，便于区分“内存不足”与“加载失败”两类问题。
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        DispatchQueue.main.async { [weak self] in
-            self?.errorMessage = "网页内容进程已终止：很可能是 iPhone 7 内存（2GB）不足以运行完整编辑器。请关闭其他后台 App 后重试；若仍失败，需要我出“精简版/播放器版”以大幅降低内存占用。"
-            self?.showError = true
-        }
+        showToast("网页内容进程已终止：很可能是 iPhone 7 内存（2GB）不足以运行完整编辑器。请关闭其他后台 App 后重试；若仍失败，需要我出“精简版/播放器版”以大幅降低内存占用。", isError: true)
     }
 
     private func reportLoadError(_ error: Error) {
-        DispatchQueue.main.async { [weak self] in
-            self?.errorMessage = "页面加载失败：\(error.localizedDescription)"
-            self?.showError = true
-        }
+        showToast("页面加载失败：\(error.localizedDescription)", isError: true)
     }
 
-    // MARK: - 保存文件到本地
+    // MARK: - 保存文件到本地（应用沙盒 Documents/ScratchProjects）
 
+    /// 网页“保存到电脑”触发后，由 JS 桥接把 .sb3 的 base64 上报到这里，
+    /// 通过 FileManager（系统文件 API）写入应用沙盒的 Documents/ScratchProjects 目录。
+    /// 该目录已开启 UIFileSharingEnabled，可在系统「文件」App 中查看。
     private func saveProject(name: String, base64: String) {
-        guard let data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters) else {
-            errorMessage = "无法解码保存的数据"
-            showError = true
+        let fileName = ScratchBridge.sanitizedFileName(name)
+        guard let data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters), !data.isEmpty else {
+            showToast("保存失败：无法解码保存的数据（内容为空或格式错误）", isError: true)
             return
         }
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let folder = documents.appendingPathComponent("ScratchProjects", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            let fileURL = folder.appendingPathComponent(name)
+            let fileURL = folder.appendingPathComponent(fileName)
             try data.write(to: fileURL, options: .atomic)
-            savedMessage = "已保存到「文件」App：ScratchProjects/\(name)"
+            // 成功提示：左上角绿色 Toast，1.5 秒后自动消失。
+            showToast("保存成功！作品已保存至文件/Gudaocode/ScratchProjects/里", isError: false)
         } catch {
-            errorMessage = error.localizedDescription
-            showError = true
+            showToast("保存失败：\(error.localizedDescription)", isError: true)
         }
+    }
+
+    /// 清洗文件名：去掉路径分隔符等非法字符，并确保以 .sb3 结尾。
+    private static func sanitizedFileName(_ name: String) -> String {
+        let illegal = CharacterSet(charactersIn: "/\\?%*|\"<>:")
+        var cleaned = name.components(separatedBy: illegal).joined(separator: "_")
+        if cleaned.isEmpty { cleaned = "project" }
+        if !cleaned.lowercased().hasSuffix(".sb3") { cleaned += ".sb3" }
+        return cleaned
     }
 
     // MARK: - 桥接脚本（注入到页面）
 
-    /// 重写 HTMLAnchorElement.click：当编辑器“保存到设备”创建 blob: 链接并点击时，
+    /// 重写 HTMLAnchorElement.click：当编辑器“保存到电脑”创建 blob: 链接并点击时，
     /// 读取其内容为 base64，通过 messageHandlers 上报原生层保存，阻止浏览器默认下载。
     private static let bridgeJS = """
     (function () {
@@ -237,28 +258,30 @@ struct ScratchGUIView: View {
     @ObservedObject private var bridge = ScratchBridge.shared
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack(alignment: .topLeading) {
             ScratchWebView(bridge: bridge)
                 .edgesIgnoringSafeArea(.all)
-        }
-        .alert(
-            isPresented: Binding(
-                get: { bridge.savedMessage != nil },
-                set: { if !$0 { bridge.savedMessage = nil } }
-            )
-        ) {
-            Alert(
-                title: Text("已保存"),
-                message: Text(bridge.savedMessage ?? ""),
-                dismissButton: .default(Text("好"))
-            )
-        }
-        .alert(isPresented: $bridge.showError) {
-            Alert(
-                title: Text("错误"),
-                message: Text(bridge.errorMessage),
-                dismissButton: .default(Text("好"))
-            )
+
+            // 左上角 Toast：成功（绿）/错误（红），由 bridge.toastMessage 驱动，自动消失。
+            if let message = bridge.toastMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: bridge.toastIsError ? "xmark.circle.fill" : "checkmark.circle.fill")
+                    Text(message)
+                        .font(.system(size: 13, weight: .medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background((bridge.toastIsError ? Color.red : Color.green).opacity(0.92))
+                .foregroundColor(.white)
+                .cornerRadius(10)
+                .shadow(color: Color.black.opacity(0.25), radius: 4, x: 0, y: 2)
+                .frame(maxWidth: 300, alignment: .leading)
+                .padding(.top, 12)
+                .padding(.leading, 12)
+                .transition(.opacity)
+                .animation(.easeInOut(duration: 0.2), value: bridge.toastMessage)
+            }
         }
     }
 }
