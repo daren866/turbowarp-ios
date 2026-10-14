@@ -24,7 +24,14 @@ let project = Project(
             deploymentTargets: deploymentTargets,
             infoPlist: .file(path: "SwiftUIStarter/Info.plist"),
             sources: ["SwiftUIStarter/**/*.swift"],
-            resources: ["SwiftUIStarter/Assets.xcassets", "SwiftUIStarter/scratchgui"]
+            resources: ["SwiftUIStarter/Assets.xcassets"],
+            scripts: [
+                .pre(
+                    path: "Scripts/copy-scratchgui.sh",
+                    name: "Copy scratch-gui web assets into app bundle",
+                    basedOnDependencyAnalysis: false
+                )
+            ]
         )
     ]
 )
