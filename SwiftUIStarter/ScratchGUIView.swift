@@ -178,8 +178,15 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     /// 使 scratch-gui 的视频侦测、声音扩展可无缝使用设备。
     /// 注意：该代理方法自 iOS 15 起可用；iPhone 7 最高可升 iOS 15，故覆盖目标设备。
     /// 系统级「App 是否允许访问相机/麦克风」的首次弹窗仍由用户确认一次，无法绕过（Apple 隐私策略）。
+    /// iOS 26 SDK 起 API 改名：决策类型 WKMediaCapturePermissionDecision → WKPermissionDecision，
+    /// 方法 decidePolicyFor:captureType: → requestMediaCapturePermissionFor:initiatedByFrame:type:。
     @available(iOS 15.0, *)
-    func webView(_ webView: WKWebView, decidePolicyFor captureType: WKMediaCaptureType, decisionHandler: @escaping (WKMediaCapturePermissionDecision) -> Void) {
+    @MainActor
+    func webView(_ webView: WKWebView,
+                 requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 type captureType: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
         decisionHandler(.grant)
     }
 
