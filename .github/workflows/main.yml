@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    permissions:
+      contents: write
 
     steps:
     - uses: actions/checkout@v4
@@ -84,3 +86,18 @@ jobs:
         name: gudaocode-unsigned-ipa
         path: ${{ github.workspace }}/build/*_iOS13_arm64.ipa
         retention-days: 30
+
+    - name: Publish IPA to GitHub Releases
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: nightly
+        name: Nightly Build
+        prerelease: true
+        make_latest: true
+        body: |
+          GudaoCode 自动构建产物（未签名 IPA，需用 TrollStore 安装，其会自行用 ldid 重签）。
+
+          提交: ${{ github.sha }}
+          提交信息: ${{ github.event.head_commit.message }}
+        files: |
+          ${{ github.workspace }}/build/*_iOS13_arm64.ipa
