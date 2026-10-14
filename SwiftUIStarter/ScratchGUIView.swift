@@ -6,6 +6,8 @@ import UIKit
 /// - 保存：拦截编辑器“保存到电脑”的 blob 下载，写入 App Documents/ScratchProjects。
 /// - 打开：底层 openProject(data:) 可将 .sb3 经 project_url(data:) 参数载入编辑器
 ///   （由编辑器自身 UI 触发，不再使用额外原生浮层按钮）。
+/// - 相机/麦克风：实现 WKUIDelegate 媒体捕获授权，拦截网页 getUserMedia 请求并直接授予，
+///   使 Scratch 的视频侦测 / 声音扩展可直接使用设备（系统首次硬件弹窗仍由用户确认一次）。
 ///
 /// 为兼容 iOS 13：以单例持有实例（避免 @StateObject 不可用导致反复重建）。
 ///
@@ -13,7 +15,7 @@ import UIKit
 /// - WKWebView 仅创建一次，避免复用 WKWebViewConfiguration 引发异常崩溃。
 /// - index.html 查找多重回退，失败不再 fatalError，而是弹错误提示。
 /// - 非持久化 websiteDataStore，降低内存/磁盘占用。
-final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate {
+final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
 
     /// 单例：iOS 13 无 @StateObject，用单例保证实例稳定、状态不丢失。
     static let shared = ScratchBridge()
@@ -89,6 +91,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false
         webView.scrollView.bounces = false
         self.webView = webView
@@ -167,6 +170,17 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     private func reportLoadError(_ error: Error) {
         showToast("页面加载失败：\(error.localizedDescription)", isError: true)
+    }
+
+    // MARK: - WKUIDelegate（媒体捕获授权：摄像头/麦克风）
+
+    /// 拦截网页对摄像头/麦克风的 getUserMedia 请求，并直接授予（.grant），
+    /// 使 scratch-gui 的视频侦测、声音扩展可无缝使用设备。
+    /// 注意：该代理方法自 iOS 15 起可用；iPhone 7 最高可升 iOS 15，故覆盖目标设备。
+    /// 系统级「App 是否允许访问相机/麦克风」的首次弹窗仍由用户确认一次，无法绕过（Apple 隐私策略）。
+    @available(iOS 15.0, *)
+    func webView(_ webView: WKWebView, decidePolicyFor captureType: WKMediaCaptureType, decisionHandler: @escaping (WKMediaCapturePermissionDecision) -> Void) {
+        decisionHandler(.grant)
     }
 
     // MARK: - 保存文件到本地（应用沙盒 Documents/ScratchProjects）
