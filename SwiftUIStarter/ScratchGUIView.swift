@@ -1,14 +1,13 @@
 import SwiftUI
 import WebKit
 import UIKit
-import MobileCoreServices
 
 /// 桥接 scratch-gui（Web 编辑器）与 iOS 原生层。
 /// - 保存：拦截编辑器“保存到设备”的 blob 下载，写入 App Documents/ScratchProjects。
-/// - 打开：提供原生文件选择器，读入 .sb3 后经 project_url(data:) 参数载入编辑器。
+/// - 打开：底层 openProject(data:) 可将 .sb3 经 project_url(data:) 参数载入编辑器
+///   （由编辑器自身 UI 触发，不再使用额外原生浮层按钮）。
 ///
-/// 为兼容 iOS 13：以单例持有实例（避免 @StateObject 不可用导致反复重建），
-/// 文件选择使用 UIDocumentPickerViewController（UIViewControllerRepresentable 包装）。
+/// 为兼容 iOS 13：以单例持有实例（避免 @StateObject 不可用导致反复重建）。
 ///
 /// 关键稳定性修正（针对 iPhone 7 / 老设备启动闪退）：
 /// - WKWebView 仅创建一次，避免复用 WKWebViewConfiguration 引发异常崩溃。
@@ -218,33 +217,6 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     """
 }
 
-// MARK: - UIDocumentPickerViewController 包装（iOS 13 可用的文件选择器）
-
-struct DocumentPicker: UIViewControllerRepresentable {
-    let onPick: (URL) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
-
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        // kUTTypeData 允许选择任意数据文件（含 .sb3）
-        let picker = UIDocumentPickerViewController(documentTypes: [kUTTypeData as String], in: .open)
-        picker.delegate = context.coordinator
-        picker.allowsMultipleSelection = false
-        return picker
-    }
-
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
-
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let onPick: (URL) -> Void
-        init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
-
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            if let url = urls.first { onPick(url) }
-        }
-    }
-}
-
 // MARK: - UIViewRepresentable 包装 WKWebView
 
 struct ScratchWebView: UIViewRepresentable {
@@ -263,38 +235,11 @@ struct ScratchWebView: UIViewRepresentable {
 
 struct ScratchGUIView: View {
     @ObservedObject private var bridge = ScratchBridge.shared
-    @State private var showPicker = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             ScratchWebView(bridge: bridge)
                 .edgesIgnoringSafeArea(.all)
-
-            // 浮动“打开”按钮：避免 iOS 13 无 .toolbar 时无法放置原生入口，
-            // 同时不与 scratch 自带顶部菜单栏（导航栏）层叠。
-            Button(action: { showPicker = true }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "folder")
-                    Text("打开")
-                }
-                .font(.system(size: 14, weight: .medium))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Color.black.opacity(0.55))
-                .foregroundColor(.white)
-                .cornerRadius(8)
-            }
-            .padding(.top, 6)
-            .padding(.trailing, 8)
-        }
-        .sheet(isPresented: $showPicker) {
-            DocumentPicker { url in
-                let accessed = url.startAccessingSecurityScopedResource()
-                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                if let data = try? Data(contentsOf: url) {
-                    bridge.openProject(data: data)
-                }
-            }
         }
         .alert(
             isPresented: Binding(
