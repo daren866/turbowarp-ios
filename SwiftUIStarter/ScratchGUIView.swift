@@ -145,6 +145,15 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         reportLoadError(error)
     }
 
+    /// 网页内容进程被系统终止（老设备 2GB 内存跑重型编辑器时常因内存压力被 jetsam 杀掉）。
+    /// 捕获后给出明确提示，便于区分“内存不足”与“加载失败”两类问题。
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        DispatchQueue.main.async { [weak self] in
+            self?.errorMessage = "网页内容进程已终止：很可能是 iPhone 7 内存（2GB）不足以运行完整编辑器。请关闭其他后台 App 后重试；若仍失败，需要我出“精简版/播放器版”以大幅降低内存占用。"
+            self?.showError = true
+        }
+    }
+
     private func reportLoadError(_ error: Error) {
         DispatchQueue.main.async { [weak self] in
             self?.errorMessage = "页面加载失败：\(error.localizedDescription)"
