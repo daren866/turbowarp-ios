@@ -88,8 +88,9 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
             )
         )
         configuration.userContentController.add(self, name: "scratchSave")
-        // 资源离线包：网页把下载到的资产 base64 上报到此，写入 Documents 沙盒；启动时再回推 hydrate。
-        configuration.userContentController.add(self, name: "offlineSaveAsset")
+        // 资源离线包：网页把待下载资产清单上报到此，由原生 URLSession 下载（规避 CORS）
+        // 写入 Documents 沙盒并回推 hydrate；启动时再回推离线状态。
+        configuration.userContentController.add(self, name: "offlineDownload")
         configuration.userContentController.add(self, name: "offlineGetAsset")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
@@ -154,12 +155,11 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
                 return
             }
             saveProject(name: name, base64: base64)
-        case "offlineSaveAsset":
-            guard let md5ext = body?["md5ext"] as? String,
-                  let base64 = body?["data"] as? String else {
-                return
-            }
-            saveOfflineAsset(md5ext: md5ext, base64: base64)
+        case "offlineDownload":
+            // 网页上报待下载资产清单：[{md5ext, url}, ...]
+            // 由原生 URLSession 下载（无 CORS 限制），校验后写盘并回推 hydrate。
+            guard let assets = body?["assets"] as? [[String: Any]] else { return }
+            handleOfflineDownload(assets: assets)
         case "offlineGetAsset":
             guard let md5ext = body?["md5ext"] as? String else { return }
             pushOfflineAsset(md5ext: md5ext)
@@ -261,16 +261,152 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         return cleaned.isEmpty ? "asset.bin" : cleaned
     }
 
-    /// 网页上报单个离线资产：base64 → 写入 Documents/OfflineAssets/{md5ext}。
-    private func saveOfflineAsset(md5ext: String, base64: String) {
-        guard let data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters), !data.isEmpty else { return }
+    /// 下载整个离线资源包（原生 URLSession 并发执行）。
+    ///
+    /// 为何由原生层下载：
+    ///   - 下载源（yyzlab 造型 / openblockcc wav）未必下发 CORS 头，网页 fetch 会被拦截；
+    ///   - yyzlab 对缺失资源返回 200 + text/html 兜底页（而非 404），需魔数校验拒绝垃圾数据；
+    ///   - 原生层写 Documents 沙盒，跨启动持久化（WKWebView 为 nonPersistent，网页存储不持久）。
+    ///
+    /// 流程：去重 → 并发下载（上限 4）→ 魔数校验 → 写盘 → 回推资产字节给网页 builtinHelper
+    ///       → 逐条回推进度 → 全部结束后回推完成。
+    /// - Parameter assets: 网页上报的资产清单 [{md5ext, url}]。
+    private func handleOfflineDownload(assets: [[String: Any]]) {
+        // 去重（按 md5ext 保序）。
+        var seen = Set<String>()
+        var list: [(md5ext: String, url: URL)] = []
+        for item in assets {
+            guard let md5ext = item["md5ext"] as? String,
+                  let urlString = item["url"] as? String,
+                  let url = URL(string: urlString) else { continue }
+            if seen.contains(md5ext) { continue }
+            seen.insert(md5ext)
+            list.append((md5ext, url))
+        }
+        let total = list.count
+        guard total > 0 else {
+            pushOfflineComplete(downloaded: 0, skipped: 0, total: 0)
+            return
+        }
+
+        let group = DispatchGroup()
+        let semaphore = DispatchSemaphore(value: 4) // 限流：老设备/弱网下避免并发过高
+        let stateQueue = DispatchQueue(label: "offline-download-state")
+        var done = 0
+        var downloaded = 0
+        var skipped = 0
+
+        let workQueue = DispatchQueue(label: "offline-download", attributes: .concurrent)
+        for entry in list {
+            group.enter()
+            workQueue.async { [weak self] in
+                semaphore.wait()
+                URLSession.shared.dataTask(with: entry.url) { [weak self] data, response, error in
+                    defer {
+                        semaphore.signal()
+                        group.leave()
+                    }
+                    var ok = false
+                    if let self = self,
+                       let data = data,
+                       error == nil,
+                       self.isValidAsset(md5ext: entry.md5ext, data: data),
+                       self.writeOfflineAsset(md5ext: entry.md5ext, data: data) {
+                        // 回推字节给网页：写入 storage.builtinHelper，当前会话立即可用。
+                        self.pushOfflineAssetData(md5ext: entry.md5ext, data: data)
+                        ok = true
+                    }
+                    stateQueue.async {
+                        done += 1
+                        if ok { downloaded += 1 } else { skipped += 1 }
+                        let progress = (done, downloaded, skipped)
+                        self?.pushOfflineProgress(done: progress.0, total: total, skipped: progress.2)
+                    }
+                }.resume()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            stateQueue.sync {
+                self?.pushOfflineComplete(downloaded: downloaded, skipped: skipped, total: total)
+            }
+        }
+    }
+
+    /// 魔数 / 内容校验：拒绝 HTML 兜底页与类型不符的数据。
+    /// - yyzlab 对缺失资源返回 200 + text/html（约 526 字节 SPA 兜底页），必须拦下。
+    private func isValidAsset(md5ext: String, data: Data) -> Bool {
+        guard !data.isEmpty else { return false }
+        let ext = (md5ext as NSString).pathExtension.lowercased()
+        let head = String(decoding: data.prefix(512), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        // 显式拒绝 HTML 兜底页（<!doctype / <html / <head / <body）。
+        if head.hasPrefix("<!doctype") || head.hasPrefix("<html")
+            || head.hasPrefix("<head") || head.hasPrefix("<body") {
+            return false
+        }
+        switch ext {
+        case "svg":
+            return head.hasPrefix("<svg") || head.hasPrefix("<?xml")
+        case "png":
+            return data.starts(with: [0x89, 0x50, 0x4E, 0x47]) // \x89PNG
+        case "jpg", "jpeg":
+            return data.starts(with: [0xFF, 0xD8, 0xFF])
+        case "wav":
+            return data.starts(with: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
+        case "mp3":
+            return data.starts(with: [0x49, 0x44, 0x33]) || data.starts(with: [0xFF, 0xFB]) // "ID3" 或帧同步
+        default:
+            return false
+        }
+    }
+
+    /// 写盘：Documents/OfflineAssets/{md5ext}。单个失败不阻断整体下载。
+    @discardableResult
+    private func writeOfflineAsset(md5ext: String, data: Data) -> Bool {
         let fileURL = offlineAssetsDir.appendingPathComponent(ScratchBridge.sanitizedAssetName(md5ext))
         do {
             try FileManager.default.createDirectory(at: offlineAssetsDir, withIntermediateDirectories: true)
             try data.write(to: fileURL, options: .atomic)
+            return true
         } catch {
-            // 单个资产写盘失败不阻断整体流程。
+            return false
         }
+    }
+
+    /// 回推单个资产字节（base64）给网页：window.__scratchOfflineAsset。
+    private func pushOfflineAssetData(md5ext: String, data: Data) {
+        guard let webView = webView else { return }
+        let payload: [String: Any] = ["md5ext": md5ext, "data": data.base64EncodedString()]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: jsonData, encoding: .utf8) else { return }
+        let js = "window.__scratchOfflineAsset && window.__scratchOfflineAsset(\(json));"
+        DispatchQueue.main.async {
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    /// 回推下载进度：window.__scratchOfflineProgress({done, total, skipped})。
+    private func pushOfflineProgress(done: Int, total: Int, skipped: Int) {
+        guard let webView = webView else { return }
+        let payload: [String: Any] = ["done": done, "total": total, "skipped": skipped]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: jsonData, encoding: .utf8) else { return }
+        let js = "window.__scratchOfflineProgress && window.__scratchOfflineProgress(\(json));"
+        DispatchQueue.main.async {
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    /// 回推下载完成：window.__scratchOfflineComplete({downloaded, skipped, total})。
+    private func pushOfflineComplete(downloaded: Int, skipped: Int, total: Int) {
+        guard let webView = webView else { return }
+        let payload: [String: Any] = ["downloaded": downloaded, "skipped": skipped, "total": total]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: jsonData, encoding: .utf8) else { return }
+        let js = "window.__scratchOfflineComplete && window.__scratchOfflineComplete(\(json));"
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     /// 是否已启用离线包：OfflineAssets 目录存在且至少有一个资产文件。
