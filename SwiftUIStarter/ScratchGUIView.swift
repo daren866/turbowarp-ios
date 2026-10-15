@@ -88,6 +88,9 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
             )
         )
         configuration.userContentController.add(self, name: "scratchSave")
+        // 资源离线包：网页把下载到的资产 base64 上报到此，写入 Documents 沙盒；启动时再回推 hydrate。
+        configuration.userContentController.add(self, name: "offlineSaveAsset")
+        configuration.userContentController.add(self, name: "offlineGetAsset")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
@@ -143,13 +146,32 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard message.name == "scratchSave",
-              let body = message.body as? [String: Any],
-              let name = body["name"] as? String,
-              let base64 = body["data"] as? String else {
-            return
+        let body = message.body as? [String: Any]
+        switch message.name {
+        case "scratchSave":
+            guard let name = body?["name"] as? String,
+                  let base64 = body?["data"] as? String else {
+                return
+            }
+            saveProject(name: name, base64: base64)
+        case "offlineSaveAsset":
+            guard let md5ext = body?["md5ext"] as? String,
+                  let base64 = body?["data"] as? String else {
+                return
+            }
+            saveOfflineAsset(md5ext: md5ext, base64: base64)
+        case "offlineGetAsset":
+            guard let md5ext = body?["md5ext"] as? String else { return }
+            pushOfflineAsset(md5ext: md5ext)
+        default:
+            break
         }
-        saveProject(name: name, base64: base64)
+    }
+
+    // MARK: - WKNavigationDelegate（加载完成回推离线状态）
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        pushOfflineState(to: webView)
     }
 
     // MARK: - WKNavigationDelegate（加载错误兜底）
@@ -221,6 +243,70 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         if cleaned.isEmpty { cleaned = "project" }
         if !cleaned.lowercased().hasSuffix(".sb3") { cleaned += ".sb3" }
         return cleaned
+    }
+
+    // MARK: - 资源离线包（Documents/OfflineAssets 持久化 + 启动 hydrate）
+
+    /// 离线资产目录：Documents/OfflineAssets（随 App 沙盒持久化，跨启动有效）。
+    private var offlineAssetsDir: URL {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return documents.appendingPathComponent("OfflineAssets", isDirectory: true)
+    }
+
+    /// 清洗资产文件名（md5ext，如 "1a2b3c.svg"）：去掉路径分隔符，仅保留末段。
+    private static func sanitizedAssetName(_ name: String) -> String {
+        let base = name.components(separatedBy: CharacterSet(charactersIn: "/\\")).last ?? name
+        let illegal = CharacterSet(charactersIn: "?%*|\"<>:")
+        let cleaned = base.components(separatedBy: illegal).joined(separator: "_")
+        return cleaned.isEmpty ? "asset.bin" : cleaned
+    }
+
+    /// 网页上报单个离线资产：base64 → 写入 Documents/OfflineAssets/{md5ext}。
+    private func saveOfflineAsset(md5ext: String, base64: String) {
+        guard let data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters), !data.isEmpty else { return }
+        let fileURL = offlineAssetsDir.appendingPathComponent(ScratchBridge.sanitizedAssetName(md5ext))
+        do {
+            try FileManager.default.createDirectory(at: offlineAssetsDir, withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            // 单个资产写盘失败不阻断整体流程。
+        }
+    }
+
+    /// 是否已启用离线包：OfflineAssets 目录存在且至少有一个资产文件。
+    private func offlineAssetsList() -> [String] {
+        let allowed = Set(["svg", "png", "jpg", "jpeg", "wav", "mp3"])
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: offlineAssetsDir.path) else {
+            return []
+        }
+        return files.filter { name in
+            let ext = (name as NSString).pathExtension.lowercased()
+            return allowed.contains(ext) && !name.hasPrefix(".")
+        }.sorted()
+    }
+
+    /// 启动时把离线状态与资产清单回推给网页（window.__scratchOfflineInit）。
+    private func pushOfflineState(to webView: WKWebView) {
+        let assets = offlineAssetsList()
+        let payload: [String: Any] = ["enabled": !assets.isEmpty, "assets": assets]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: jsonData, encoding: .utf8) else { return }
+        let js = "window.__scratchOfflineInit && window.__scratchOfflineInit(\(json));"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// 网页请求单个离线资产字节：读盘 → base64 → 回推 window.__scratchOfflineAsset。
+    private func pushOfflineAsset(md5ext: String) {
+        guard let webView = webView else { return }
+        let fileURL = offlineAssetsDir.appendingPathComponent(ScratchBridge.sanitizedAssetName(md5ext))
+        guard let data = FileManager.default.contents(atPath: fileURL.path) else { return }
+        let payload: [String: Any] = ["md5ext": md5ext, "data": data.base64EncodedString()]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: jsonData, encoding: .utf8) else { return }
+        let js = "window.__scratchOfflineAsset && window.__scratchOfflineAsset(\(json));"
+        DispatchQueue.main.async {
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
     }
 
     // MARK: - 桥接脚本（注入到页面）
