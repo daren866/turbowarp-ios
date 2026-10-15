@@ -264,8 +264,9 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     /// 下载整个离线资源包（原生 URLSession 并发执行）。
     ///
     /// 为何由原生层下载：
-    ///   - 造型源 m.ccw.site（腾讯云 COS）虽带 CORS `*`，但原生层下载更稳、可写 Documents 沙盒并跨启动持久化；
-    ///   - 缺失资产返回正常 404（m.ccw.site 为 404 + XML），需按 HTTP 状态判定跳过，并以魔数校验兜底；
+    ///   - 非 wav 资源走 cdn.coding321.com/assets（阿里云 OSS，无 CORS 头）；原生层 URLSession 无视 CORS，
+    ///     且可写 Documents 沙盒并跨启动持久化；wav 仍走 openblockcc（带 CORS `*`）。
+    ///   - 缺失资产返回正常 404（coding321 为 404 + XML），需按 HTTP 状态判定跳过，并以魔数校验兜底；
     ///   - WKWebView 为 nonPersistent，网页存储不持久，故持久化统一走原生 Documents。
     ///
     /// 流程：去重 → 并发下载（上限 4）→ HTTP 状态/魔数校验 → 写盘 → 回推资产字节给网页 builtinHelper
@@ -338,7 +339,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     }
 
     /// 魔数 / 内容校验：拒绝 XML/HTML 错误体（404 等）与类型不符的数据。
-    /// - m.ccw.site 对缺失资源返回 404 + XML 错误体（约 400 字节）；虽已被上方 HTTP 状态判断拦下，
+    /// - coding321 对缺失资源返回 404 + XML 错误体（约 400 字节）；虽已被上方 HTTP 状态判断拦下，
     ///   此处魔数校验作为第二道防线，并防御其他异常响应。
     private func isValidAsset(md5ext: String, data: Data) -> Bool {
         guard !data.isEmpty else { return false }
