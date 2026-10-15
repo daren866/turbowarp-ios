@@ -264,11 +264,11 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     /// 下载整个离线资源包（原生 URLSession 并发执行）。
     ///
     /// 为何由原生层下载：
-    ///   - 下载源（yyzlab 造型 / openblockcc wav）未必下发 CORS 头，网页 fetch 会被拦截；
-    ///   - yyzlab 对缺失资源返回 200 + text/html 兜底页（而非 404），需魔数校验拒绝垃圾数据；
-    ///   - 原生层写 Documents 沙盒，跨启动持久化（WKWebView 为 nonPersistent，网页存储不持久）。
+    ///   - 造型源 m.ccw.site（腾讯云 COS）虽带 CORS `*`，但原生层下载更稳、可写 Documents 沙盒并跨启动持久化；
+    ///   - 缺失资产返回正常 404（m.ccw.site 为 404 + XML），需按 HTTP 状态判定跳过，并以魔数校验兜底；
+    ///   - WKWebView 为 nonPersistent，网页存储不持久，故持久化统一走原生 Documents。
     ///
-    /// 流程：去重 → 并发下载（上限 4）→ 魔数校验 → 写盘 → 回推资产字节给网页 builtinHelper
+    /// 流程：去重 → 并发下载（上限 4）→ HTTP 状态/魔数校验 → 写盘 → 回推资产字节给网页 builtinHelper
     ///       → 逐条回推进度 → 全部结束后回推完成。
     /// - Parameter assets: 网页上报的资产清单 [{md5ext, url}]。
     private func handleOfflineDownload(assets: [[String: Any]]) {
@@ -306,8 +306,12 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
                         semaphore.signal()
                         group.leave()
                     }
+                    // 仅接受 HTTP 200 的真实响应；缺失资产返回 404（m.ccw.site 为正常 404 + XML），
+                    // 或发生网络错误时，均视为“跳过该资产”，继续下一个。
+                    let httpOK = (response as? HTTPURLResponse)?.statusCode == 200
                     var ok = false
                     if let self = self,
+                       httpOK,
                        let data = data,
                        error == nil,
                        self.isValidAsset(md5ext: entry.md5ext, data: data),
@@ -333,8 +337,9 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         }
     }
 
-    /// 魔数 / 内容校验：拒绝 HTML 兜底页与类型不符的数据。
-    /// - yyzlab 对缺失资源返回 200 + text/html（约 526 字节 SPA 兜底页），必须拦下。
+    /// 魔数 / 内容校验：拒绝 XML/HTML 错误体（404 等）与类型不符的数据。
+    /// - m.ccw.site 对缺失资源返回 404 + XML 错误体（约 400 字节）；虽已被上方 HTTP 状态判断拦下，
+    ///   此处魔数校验作为第二道防线，并防御其他异常响应。
     private func isValidAsset(md5ext: String, data: Data) -> Bool {
         guard !data.isEmpty else { return false }
         let ext = (md5ext as NSString).pathExtension.lowercased()
