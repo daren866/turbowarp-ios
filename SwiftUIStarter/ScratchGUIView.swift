@@ -6,8 +6,12 @@ import UniformTypeIdentifiers
 /// 桥接 scratch-gui（Web 编辑器）与 iOS 原生层。
 /// - 保存：拦截编辑器“保存到设备”的 blob 下载（bridgeJS 重写 anchor click），
 ///   写入 App Documents/ScratchProjects（系统「文件」App 可见）。
-/// - 打开：WKUIDelegate.runOpenPanel 弹出系统文件选择器，选中 .sb3/.sb2 后
-///   经 project_url(data:) 参数载入编辑器（openProject(data:)）。
+/// - 打开：两条互补路径，均弹出系统文件选择器，选中 .sb3/.sb2 后经
+///   project_url(data:) 参数载入编辑器（openProject(data:)）：
+///   1) bridgeJS 重写 input[type=file].click：命中作品类 accept（.sb/.sb2/.sb3）时
+///      上报 scratchOpen 消息，由原生弹出选择器——iOS 13+ 全版本可用；
+///   2) iOS 18.4+ 的 WKUIDelegate.runOpenPanelWith（WKWebView 的文件输入支持自
+///      18.4 才加入），作为 JS 拦截未生效时的系统兜底。
 /// - 相机/麦克风：实现 WKUIDelegate 媒体捕获授权，拦截网页 getUserMedia 请求并直接授予，
 ///   使 Scratch 的视频侦测 / 声音扩展可直接使用设备（系统首次硬件弹窗仍由用户确认一次）。
 ///
@@ -34,8 +38,8 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     private var indexURL: URL?
     private var scratchDir: URL?
 
-    /// 「从电脑中打开」：onShowFileChooser 对应的文件选择器回调（runOpenPanel），
-    /// 选中/取消后必须调用一次把结果回传 WebKit。
+    /// 「从电脑中打开」：文件选择器回调（runOpenPanelWith / scratchOpen 消息两条路径），
+    /// 选中/取消后必须调用一次把结果回传 WebKit（JS 拦截路径无网页回调，回传 nil 无害）。
     private var openPanelCompletion: (([URL]?) -> Void)?
 
     // MARK: - 初始化
@@ -109,6 +113,8 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         // 写入 Documents 沙盒并回推 hydrate；启动时再回推离线状态。
         configuration.userContentController.add(self, name: "offlineDownload")
         configuration.userContentController.add(self, name: "offlineGetAsset")
+        // 「从电脑中打开」：网页作品类文件输入点击经 JS 拦截上报到此，弹出系统选择器
+        configuration.userContentController.add(self, name: "scratchOpen")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
@@ -158,13 +164,24 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         }
     }
 
-    /// 「从电脑中打开」：网页 input[type=file] 需经 runOpenPanel 才会弹出系统文件选择器，
-    /// 否则 WKWebView 内点击无反应。选中 .sb3/.sb2 后读入数据，经 openProject(data:) 载入编辑器。
+    /// 「从电脑中打开」路径 2（iOS 18.4+ 系统兜底）：WKWebView 的文件输入支持自
+    /// iOS 18.4 才加入（WKOpenPanelParameters 仅 18.4+ 可用）；更低版本无此 API，
+    /// 由路径 1（bridgeJS 拦截 input 点击 → scratchOpen 消息）接管。
+    @available(iOS 18.4, *)
     @MainActor
     func webView(_ webView: WKWebView,
                  runOpenPanelWith parameters: WKOpenPanelParameters,
                  initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping ([URL]?) -> Void) {
+        presentProjectPicker()
+        openPanelCompletion = completionHandler
+    }
+
+    /// 弹出 .sb3/.sb2 系统文件选择器（UIDocumentPickerViewController，iOS 8+ 全版本可用）。
+    /// 入口一：scratchOpen 消息（bridgeJS 拦截作品类文件输入点击，主路径）；
+    /// 入口二：iOS 18.4+ 的 runOpenPanelWith（系统兜底）。
+    /// 选中/取消经 UIDocumentPickerDelegate 回调处理，openPanelCompletion 回传 WebKit。
+    private func presentProjectPicker() {
         let picker: UIDocumentPickerViewController
         if #available(iOS 14.0, *) {
             // .sb3/.sb2 本质是 zip 归档；动态声明 UTType 让选择器精确显示作品文件。
@@ -177,7 +194,6 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         }
         picker.allowsMultipleSelection = false
         picker.delegate = self
-        openPanelCompletion = completionHandler
         presentingViewController?.present(picker, animated: true)
     }
 
@@ -236,6 +252,12 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         case "offlineGetAsset":
             guard let md5ext = body?["md5ext"] as? String else { return }
             pushOfflineAsset(md5ext: md5ext)
+        case "scratchOpen":
+            // 网页「从电脑中打开」点击（作品类文件输入）→ 弹出系统文件选择器。
+            // WKScriptMessageHandler 不保证主线程，UI 相关操作统一派发回主队列。
+            DispatchQueue.main.async { [weak self] in
+                self?.presentProjectPicker()
+            }
         default:
             break
         }
@@ -627,6 +649,9 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     /// 重写 HTMLAnchorElement.click：当编辑器“保存到电脑”创建 blob: 链接并点击时，
     /// 读取其内容为 base64，通过 messageHandlers 上报原生层保存，阻止浏览器默认下载。
+    /// 重写 HTMLInputElement.click：当 scratch-gui「从电脑中打开」点击作品类文件输入
+    ///（accept 含 .sb/.sb2/.sb3）时，上报 scratchOpen 消息由原生弹出系统文件选择器
+    /// ——WKWebView 在 iOS 18.4 以下不支持文件输入，点击本身无反应，故必须拦截。
     private static let bridgeJS = """
     (function () {
       if (window.__scratchBridgeInstalled) return;
@@ -654,6 +679,21 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
           return;
         }
         return origClick.apply(this, arguments);
+      };
+
+      // 「从电脑中打开」：仅拦截作品类文件输入（accept=.sb/.sb2/.sb3），
+      // 素材上传（.svg/.png/.wav 等）与设置导入（.json）不受影响。
+      var origInputClick = HTMLInputElement.prototype.click;
+      HTMLInputElement.prototype.click = function () {
+        if (this.type === 'file' &&
+            typeof this.accept === 'string' &&
+            /\\.sb(2|3)?(,|$)/.test(this.accept) &&
+            window.webkit && window.webkit.messageHandlers &&
+            window.webkit.messageHandlers.scratchOpen) {
+          window.webkit.messageHandlers.scratchOpen.postMessage({});
+          return;
+        }
+        return origInputClick.apply(this, arguments);
       };
     })();
     """
