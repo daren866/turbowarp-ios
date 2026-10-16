@@ -264,10 +264,16 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     }
 
     /// 预置离线资产目录：.app bundle 根下 OfflineAssets（copy-scratchgui.sh 构建期拷入，随 App 分发）。
-    /// 存放 default project 的素材（backdrop + costume），启动 hydrate 即可用，免用户手动下载。
+    /// 存放 default project 素材与素材库资产（ costumes/backdrops/sounds ），免用户手动下载。
     private var bundledAssetsDir: URL? {
         Bundle.main.resourceURL?.appendingPathComponent("OfflineAssets", isDirectory: true)
     }
+
+    /// default project 资产（md5ext）：量小，document start 同步注入，保首屏 storage.load 命中。
+    private static let defaultProjectAssets = Set([
+        "cd21514d0531fdffb22204e0ec5ed84a.svg",
+        "927d672925e7b99f7813735c484c6922.svg"
+    ])
 
     /// 清洗资产文件名（md5ext，如 "1a2b3c.svg"）：去掉路径分隔符，仅保留末段。
     private static func sanitizedAssetName(_ name: String) -> String {
@@ -462,24 +468,25 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
-    /// 是否已启用离线包：OfflineAssets 目录存在且至少有一个资产文件。
-    /// 合并用户下载的（Documents/OfflineAssets）与随包预置的（bundle OfflineAssets）资产。
-    private func offlineAssetsList() -> [String] {
+    /// 用户下载的离线资产列表（Documents/OfflineAssets）。预置资产走懒加载，不在此逐个列出。
+    private func userDownloadedAssetList() -> [String] {
         let allowed = Set(["svg", "png", "jpg", "jpeg", "wav", "mp3"])
-        var names = Set<String>()
-        let documents = try? FileManager.default.contentsOfDirectory(atPath: offlineAssetsDir.path)
-        for name in (documents ?? []) where allowed.contains((name as NSString).pathExtension.lowercased())
-            && !name.hasPrefix(".") {
-            names.insert(name)
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: offlineAssetsDir.path) else {
+            return []
         }
-        if let bundled = bundledAssetsDir,
-           let files = try? FileManager.default.contentsOfDirectory(atPath: bundled.path) {
-            for name in files where allowed.contains((name as NSString).pathExtension.lowercased())
-                && !name.hasPrefix(".") {
-                names.insert(name)
-            }
+        return files.filter { name in
+            let ext = (name as NSString).pathExtension.lowercased()
+            return allowed.contains(ext) && !name.hasPrefix(".")
+        }.sorted()
+    }
+
+    /// 是否随包预置了离线资产（bundle OfflineAssets 非空）。
+    private var hasBundledAssets: Bool {
+        guard let dir = bundledAssetsDir,
+              let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            return false
         }
-        return names.sorted()
+        return !files.isEmpty
     }
 
     /// 读取离线资产字节：先用户下载目录（Documents/OfflineAssets），再随包预置目录（bundle OfflineAssets）。
@@ -497,9 +504,13 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     }
 
     /// 启动时把离线状态与资产清单回推给网页（window.__scratchOfflineInit）。
+    /// 仅推用户下载的资产；随包预置资产（素材库）由网页侧按 storage.load 懒加载，不在此逐个 hydrate。
     private func pushOfflineState(to webView: WKWebView) {
-        let assets = offlineAssetsList()
-        let payload: [String: Any] = ["enabled": !assets.isEmpty, "assets": assets]
+        let assets = userDownloadedAssetList()
+        let payload: [String: Any] = [
+            "enabled": !assets.isEmpty || hasBundledAssets,
+            "assets": assets
+        ]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: jsonData, encoding: .utf8) else { return }
         let js = "window.__scratchOfflineInit && window.__scratchOfflineInit(\(json));"
@@ -521,24 +532,31 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     // MARK: - 桥接脚本（注入到页面）
 
-    /// 预置资产注入脚本（document start 执行）：读取 bundle 内 OfflineAssets 目录
-    /// （copy-scratchgui.sh 构建期拷入，存放 default project 素材），以 base64 写入
-    /// window.__scratchBundledAssets。网页侧 offline-assets.js 在模块加载时同步消费，
-    /// 早于 VM 加载作品 → storage.load 必命中 builtinHelper 缓存，无竞态、离线可用。
+    /// 预置资产注入脚本（document start 执行）：
+    ///  - window.__scratchBundledAssets：default project 素材 base64 map（量小，模块加载时同步消费，
+    ///    保证 VM 加载作品时 storage.load 命中缓存，无 hydrate 竞态）；
+    ///  - window.__scratchBundledIndex：预置资产全量清单（素材库 1300+ 资产，启动仅注入清单，
+    ///    网页侧拦截 storage.load 按需懒加载，避免全量 hydrate 拖垮低端设备内存）。
     private static var bundledAssetsJS: String {
         let allowed = Set(["svg", "png", "jpg", "jpeg", "wav", "mp3"])
-        var map: [String: String] = [:]
+        var defaultMap: [String: String] = [:]
+        var index: [String] = []
         if let dir = Bundle.main.resourceURL?.appendingPathComponent("OfflineAssets", isDirectory: true),
            let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
             for name in files where allowed.contains((name as NSString).pathExtension.lowercased()) {
-                if let data = FileManager.default.contents(atPath: dir.appendingPathComponent(name).path) {
-                    map[name] = data.base64EncodedString()
+                index.append(name)
+                if defaultProjectAssets.contains(name),
+                   let data = FileManager.default.contents(atPath: dir.appendingPathComponent(name).path) {
+                    defaultMap[name] = data.base64EncodedString()
                 }
             }
         }
-        let json = ((try? JSONSerialization.data(withJSONObject: map))
+        index.sort()
+        let mapJson = ((try? JSONSerialization.data(withJSONObject: defaultMap))
             .flatMap { String(data: $0, encoding: .utf8) }) ?? "{}"
-        return "window.__scratchBundledAssets = \(json);"
+        let indexJson = ((try? JSONSerialization.data(withJSONObject: index))
+            .flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
+        return "window.__scratchBundledAssets = \(mapJson);\nwindow.__scratchBundledIndex = \(indexJson);"
     }
 
     /// 重写 HTMLAnchorElement.click：当编辑器“保存到电脑”创建 blob: 链接并点击时，
