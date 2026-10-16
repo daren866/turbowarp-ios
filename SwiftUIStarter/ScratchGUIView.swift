@@ -273,20 +273,26 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     ///       → 逐条回推进度 → 全部结束后回推完成。
     /// - Parameter assets: 网页上报的资产清单 [{md5ext, url}]。
     private func handleOfflineDownload(assets: [[String: Any]]) {
-        // 去重（按 md5ext 保序）。
+        // 去重（按 md5ext 保序）；每个资产带一组候选源 URL（按优先级，原生层顺序回退）。
         var seen = Set<String>()
-        var list: [(md5ext: String, url: URL)] = []
+        var list: [(md5ext: String, urls: [URL])] = []
         for item in assets {
-            guard let md5ext = item["md5ext"] as? String,
-                  let urlString = item["url"] as? String,
-                  let url = URL(string: urlString) else { continue }
+            guard let md5ext = item["md5ext"] as? String else { continue }
             if seen.contains(md5ext) { continue }
+            var urlStrings: [String] = []
+            if let urls = item["urls"] as? [String] {
+                urlStrings = urls
+            } else if let single = item["url"] as? String {
+                urlStrings = [single]
+            }
+            let urls = urlStrings.compactMap { URL(string: $0) }
+            if urls.isEmpty { continue }
             seen.insert(md5ext)
-            list.append((md5ext, url))
+            list.append((md5ext, urls))
         }
         let total = list.count
         guard total > 0 else {
-            pushOfflineComplete(downloaded: 0, skipped: 0, total: 0)
+            pushOfflineComplete(downloaded: 0, skipped: 0, total: 0, notFound: 0)
             return
         }
 
@@ -295,47 +301,67 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         let stateQueue = DispatchQueue(label: "offline-download-state")
         var done = 0
         var downloaded = 0
-        var skipped = 0
+        var notFound = 0
 
         let workQueue = DispatchQueue(label: "offline-download", attributes: .concurrent)
         for entry in list {
             group.enter()
             workQueue.async { [weak self] in
                 semaphore.wait()
-                URLSession.shared.dataTask(with: entry.url) { [weak self] data, response, error in
-                    defer {
-                        semaphore.signal()
-                        group.leave()
-                    }
-                    // 仅接受 HTTP 200 的真实响应；缺失资产返回 404（m.ccw.site 为正常 404 + XML），
-                    // 或发生网络错误时，均视为“跳过该资产”，继续下一个。
-                    let httpOK = (response as? HTTPURLResponse)?.statusCode == 200
-                    var ok = false
-                    if let self = self,
-                       httpOK,
-                       let data = data,
-                       error == nil,
-                       self.isValidAsset(md5ext: entry.md5ext, data: data),
-                       self.writeOfflineAsset(md5ext: entry.md5ext, data: data) {
-                        // 回推字节给网页：写入 storage.builtinHelper，当前会话立即可用。
-                        self.pushOfflineAssetData(md5ext: entry.md5ext, data: data)
-                        ok = true
-                    }
-                    stateQueue.async {
-                        done += 1
-                        if ok { downloaded += 1 } else { skipped += 1 }
-                        let progress = (done, downloaded, skipped)
-                        self?.pushOfflineProgress(done: progress.0, total: total, skipped: progress.2)
-                    }
-                }.resume()
+                defer {
+                    semaphore.signal()
+                    group.leave()
+                }
+                // 顺序尝试各候选源，取第一个 HTTP 200 且通过魔数校验的；全部失败视为“未找到”。
+                var ok = false
+                if let self = self,
+                   let data = self.downloadFirstValid(md5ext: entry.md5ext, urls: entry.urls),
+                   self.writeOfflineAsset(md5ext: entry.md5ext, data: data) {
+                    // 回推字节给网页：写入 storage.builtinHelper，当前会话立即可用。
+                    self.pushOfflineAssetData(md5ext: entry.md5ext, data: data)
+                    ok = true
+                }
+                stateQueue.async {
+                    done += 1
+                    if ok { downloaded += 1 } else { notFound += 1 }
+                    let progress = (done, downloaded, notFound)
+                    self?.pushOfflineProgress(done: progress.0, total: total, skipped: progress.2)
+                }
             }
         }
 
         group.notify(queue: .main) { [weak self] in
             stateQueue.sync {
-                self?.pushOfflineComplete(downloaded: downloaded, skipped: skipped, total: total)
+                self?.pushOfflineComplete(downloaded: downloaded, skipped: notFound, total: total, notFound: notFound)
             }
         }
+    }
+
+    /// 顺序尝试各候选源，返回第一个 HTTP 200 且通过魔数校验的字节；全部失败返回 nil。
+    private func downloadFirstValid(md5ext: String, urls: [URL]) -> Data? {
+        for url in urls {
+            let (httpOK, data) = downloadSync(url: url)
+            if httpOK, let data = data, isValidAsset(md5ext: md5ext, data: data) {
+                NSLog("[offline] %@ OK <- %@", md5ext, url.absoluteString)
+                return data
+            }
+        }
+        NSLog("[offline] %@ NOT FOUND on all sources", md5ext)
+        return nil
+    }
+
+    /// 同步下载单个 URL（用于在一个 work item 内顺序回退候选源）。
+    private func downloadSync(url: URL) -> (httpOK: Bool, data: Data?) {
+        let sem = DispatchSemaphore(value: 0)
+        var httpOK = false
+        var outData: Data?
+        URLSession.shared.dataTask(with: url) { data, response, error in
+            httpOK = (response as? HTTPURLResponse)?.statusCode == 200
+            outData = (error == nil) ? data : nil
+            sem.signal()
+        }.resume()
+        sem.wait()
+        return (httpOK, outData)
     }
 
     /// 魔数 / 内容校验：拒绝 XML/HTML 错误体（404 等）与类型不符的数据。
@@ -405,10 +431,10 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         }
     }
 
-    /// 回推下载完成：window.__scratchOfflineComplete({downloaded, skipped, total})。
-    private func pushOfflineComplete(downloaded: Int, skipped: Int, total: Int) {
+    /// 回推下载完成：window.__scratchOfflineComplete({downloaded, skipped, total, notFound})。
+    private func pushOfflineComplete(downloaded: Int, skipped: Int, total: Int, notFound: Int) {
         guard let webView = webView else { return }
-        let payload: [String: Any] = ["downloaded": downloaded, "skipped": skipped, "total": total]
+        let payload: [String: Any] = ["downloaded": downloaded, "skipped": skipped, "total": total, "notFound": notFound]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: jsonData, encoding: .utf8) else { return }
         let js = "window.__scratchOfflineComplete && window.__scratchOfflineComplete(\(json));"
