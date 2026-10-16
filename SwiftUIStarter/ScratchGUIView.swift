@@ -160,6 +160,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     /// 「从电脑中打开」：网页 input[type=file] 需经 runOpenPanel 才会弹出系统文件选择器，
     /// 否则 WKWebView 内点击无反应。选中 .sb3/.sb2 后读入数据，经 openProject(data:) 载入编辑器。
+    @MainActor
     func webView(_ webView: WKWebView,
                  runOpenPanelWith parameters: WKOpenPanelParameters,
                  initiatedByFrame frame: WKFrameInfo,
@@ -181,6 +182,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     }
 
     /// UIDocumentPickerDelegate：选中作品 → 读入字节 → openProject 载入编辑器 → 回传 URL 给 WebKit。
+    @MainActor
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         defer { openPanelCompletion = nil }
         guard let url = urls.first else {
@@ -196,6 +198,7 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     }
 
     /// UIDocumentPickerDelegate：用户取消选择 → 回传 nil（必须调用，否则网页侧回调悬挂）。
+    @MainActor
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
         openPanelCompletion?(nil)
         openPanelCompletion = nil
