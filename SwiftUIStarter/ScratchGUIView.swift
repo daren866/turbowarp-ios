@@ -90,9 +90,10 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         // 预置离线资产（document start）：在页面任何脚本执行前把 bundle 内资产写入
         // window.__scratchBundledAssets，offline-assets.js 模块加载时同步消费，
         // 保证 VM 加载作品时 storage.load 必命中缓存（无 hydrate 竞态）。
+        // 追加用户下载资产清单（window.__scratchUserAssets）：本地资源无论联网与否一律优先。
         configuration.userContentController.addUserScript(
             WKUserScript(
-                source: ScratchBridge.bundledAssetsJS,
+                source: ScratchBridge.bundledAssetsJS + userAssetsInjectionJS(),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: false
             )
@@ -480,15 +481,6 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         }.sorted()
     }
 
-    /// 是否随包预置了离线资产（bundle OfflineAssets 非空）。
-    private var hasBundledAssets: Bool {
-        guard let dir = bundledAssetsDir,
-              let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
-            return false
-        }
-        return !files.isEmpty
-    }
-
     /// 读取离线资产字节：先用户下载目录（Documents/OfflineAssets），再随包预置目录（bundle OfflineAssets）。
     private func readOfflineAsset(md5ext: String) -> Data? {
         let name = ScratchBridge.sanitizedAssetName(md5ext)
@@ -504,11 +496,12 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     }
 
     /// 启动时把离线状态与资产清单回推给网页（window.__scratchOfflineInit）。
-    /// 仅推用户下载的资产；随包预置资产（素材库）由网页侧按 storage.load 懒加载，不在此逐个 hydrate。
+    /// 仅推用户下载的资产做 hydrate 预热；随包预置资产（素材库）由网页侧按 storage.load 懒加载，不在此逐个 hydrate。
+    /// 离线资源包无条件启用：本地资源（预置 + 用户下载）无论联网与否一律优先，故 enabled 恒为 true。
     private func pushOfflineState(to webView: WKWebView) {
         let assets = userDownloadedAssetList()
         let payload: [String: Any] = [
-            "enabled": !assets.isEmpty || hasBundledAssets,
+            "enabled": true,
             "assets": assets
         ]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
@@ -537,6 +530,8 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     ///    保证 VM 加载作品时 storage.load 命中缓存，无 hydrate 竞态）；
     ///  - window.__scratchBundledIndex：预置资产全量清单（素材库 1300+ 资产，启动仅注入清单，
     ///    网页侧拦截 storage.load 按需懒加载，避免全量 hydrate 拖垮低端设备内存）。
+    /// 用户下载的资产清单（window.__scratchUserAssets）由实例方法 userAssetsInjectionJS() 追加
+    /// （依赖 Documents 目录，需实例上下文）。
     private static var bundledAssetsJS: String {
         let allowed = Set(["svg", "png", "jpg", "jpeg", "wav", "mp3"])
         var defaultMap: [String: String] = [:]
@@ -557,6 +552,15 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         let indexJson = ((try? JSONSerialization.data(withJSONObject: index))
             .flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
         return "window.__scratchBundledAssets = \(mapJson);\nwindow.__scratchBundledIndex = \(indexJson);"
+    }
+
+    /// 用户下载资产清单注入脚本（document start 执行，拼在 bundledAssetsJS 之后）：
+    /// window.__scratchUserAssets：Documents/OfflineAssets 中的作品资产清单，
+    /// 与预置清单合并后作为 storage.load「本地优先」的拦截依据（无论联网与否）。
+    private func userAssetsInjectionJS() -> String {
+        let userJson = ((try? JSONSerialization.data(withJSONObject: userDownloadedAssetList()))
+            .flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
+        return "window.__scratchUserAssets = \(userJson);"
     }
 
     /// 重写 HTMLAnchorElement.click：当编辑器“保存到电脑”创建 blob: 链接并点击时，
