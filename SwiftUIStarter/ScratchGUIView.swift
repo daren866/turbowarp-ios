@@ -1,11 +1,13 @@
 import SwiftUI
 import WebKit
 import UIKit
+import UniformTypeIdentifiers
 
 /// 桥接 scratch-gui（Web 编辑器）与 iOS 原生层。
-/// - 保存：拦截编辑器“保存到电脑”的 blob 下载，写入 App Documents/ScratchProjects。
-/// - 打开：底层 openProject(data:) 可将 .sb3 经 project_url(data:) 参数载入编辑器
-///   （由编辑器自身 UI 触发，不再使用额外原生浮层按钮）。
+/// - 保存：拦截编辑器“保存到设备”的 blob 下载（bridgeJS 重写 anchor click），
+///   写入 App Documents/ScratchProjects（系统「文件」App 可见）。
+/// - 打开：WKUIDelegate.runOpenPanel 弹出系统文件选择器，选中 .sb3/.sb2 后
+///   经 project_url(data:) 参数载入编辑器（openProject(data:)）。
 /// - 相机/麦克风：实现 WKUIDelegate 媒体捕获授权，拦截网页 getUserMedia 请求并直接授予，
 ///   使 Scratch 的视频侦测 / 声音扩展可直接使用设备（系统首次硬件弹窗仍由用户确认一次）。
 ///
@@ -15,7 +17,7 @@ import UIKit
 /// - WKWebView 仅创建一次，避免复用 WKWebViewConfiguration 引发异常崩溃。
 /// - index.html 查找多重回退，失败不再 fatalError，而是弹错误提示。
 /// - 非持久化 websiteDataStore，降低内存/磁盘占用。
-final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
+final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, UIDocumentPickerDelegate {
 
     /// 单例：iOS 13 无 @StateObject，用单例保证实例稳定、状态不丢失。
     static let shared = ScratchBridge()
@@ -31,6 +33,10 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     private(set) var webView: WKWebView?
     private var indexURL: URL?
     private var scratchDir: URL?
+
+    /// 「从电脑中打开」：onShowFileChooser 对应的文件选择器回调（runOpenPanel），
+    /// 选中/取消后必须调用一次把结果回传 WebKit。
+    private var openPanelCompletion: (([URL]?) -> Void)?
 
     // MARK: - 初始化
 
@@ -150,6 +156,59 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         if let url = components.url {
             webView?.loadFileURL(url, allowingReadAccessTo: scratchDir)
         }
+    }
+
+    /// 「从电脑中打开」：网页 input[type=file] 需经 runOpenPanel 才会弹出系统文件选择器，
+    /// 否则 WKWebView 内点击无反应。选中 .sb3/.sb2 后读入数据，经 openProject(data:) 载入编辑器。
+    func webView(_ webView: WKWebView,
+                 runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        let picker: UIDocumentPickerViewController
+        if #available(iOS 14.0, *) {
+            // .sb3/.sb2 本质是 zip 归档；动态声明 UTType 让选择器精确显示作品文件。
+            let sb3 = UTType(filenameExtension: "sb3", conformingTo: .archive) ?? .archive
+            let sb2 = UTType(filenameExtension: "sb2", conformingTo: .archive) ?? .archive
+            picker = UIDocumentPickerViewController(forOpeningContentTypes: [sb3, sb2], asCopy: true)
+        } else {
+            // iOS 13：无 UniformTypeIdentifiers，退化为归档类型。
+            picker = UIDocumentPickerViewController(documentTypes: ["public.archive"], in: .import)
+        }
+        picker.allowsMultipleSelection = false
+        picker.delegate = self
+        openPanelCompletion = completionHandler
+        presentingViewController?.present(picker, animated: true)
+    }
+
+    /// UIDocumentPickerDelegate：选中作品 → 读入字节 → openProject 载入编辑器 → 回传 URL 给 WebKit。
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        defer { openPanelCompletion = nil }
+        guard let url = urls.first else {
+            openPanelCompletion?(nil)
+            return
+        }
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        if let data = try? Data(contentsOf: url), !data.isEmpty {
+            openProject(data: data)
+        }
+        openPanelCompletion?([url])
+    }
+
+    /// UIDocumentPickerDelegate：用户取消选择 → 回传 nil（必须调用，否则网页侧回调悬挂）。
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        openPanelCompletion?(nil)
+        openPanelCompletion = nil
+    }
+
+    /// 从 WebView 的 responder chain 找到承载的 UIViewController（用于 present 文件选择器）。
+    private var presentingViewController: UIViewController? {
+        var responder: UIResponder? = webView
+        while let current = responder {
+            if let vc = current as? UIViewController { return vc }
+            responder = current.next
+        }
+        return nil
     }
 
     // MARK: - WKScriptMessageHandler
