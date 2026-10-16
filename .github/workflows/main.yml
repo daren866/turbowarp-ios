@@ -35,6 +35,7 @@ jobs:
         PROJECT_NAME=$(basename "$PROJECT_FILE" .xcodeproj)
         SCHEME_NAME="$PROJECT_NAME"
         echo "Project: $PROJECT_NAME, Scheme: $SCHEME_NAME"
+        set +e
         xcodebuild clean archive \
           -project "$PROJECT_NAME.xcodeproj" \
           -scheme "$SCHEME_NAME" \
@@ -47,7 +48,27 @@ jobs:
           ENABLE_BITCODE=NO \
           ARCHS=arm64 \
           ONLY_ACTIVE_ARCH=NO \
-          IPHONEOS_DEPLOYMENT_TARGET=13.0
+          IPHONEOS_DEPLOYMENT_TARGET=13.0 > build.log 2>&1
+        STATUS=$?
+        set -e
+        echo "----- xcodebuild log (tail) -----"
+        tail -n 300 build.log || true
+        if [ "$STATUS" -ne 0 ]; then
+          echo "----- compiler errors (annotated) -----"
+          grep -n "error:" build.log | head -n 60 || true
+          grep -n "error:" build.log | head -n 60 | while IFS= read -r line; do
+            echo "::error ::${line}"
+          done
+        fi
+        exit $STATUS
+
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: build.log
+        retention-days: 30
 
     - name: Package unsigned IPA
       id: package_ipa
