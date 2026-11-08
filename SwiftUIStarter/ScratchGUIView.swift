@@ -17,6 +17,16 @@ import UniformTypeIdentifiers
 ///
 /// 为兼容 iOS 13：以单例持有实例（避免 @StateObject 不可用导致反复重建）。
 ///
+/// 「使用原生级快速引擎」开关（预留接口）：
+/// - 网页设置弹窗上报 fastEngine 消息 → 原生层以 UserDefaults 持久化 →
+///   重新 loadFileURL 加载作品（保留 project_url），实现「勾选后重新加载作品」。
+/// - 开关通过 URL query（fastEngine）+ atDocumentStart 注入 + didFinish 回推
+///   三层提供给网页的 window.__fastEngineEnabled，作为未来原生引擎的模式标志。
+/// - **注意**：当前不把 scratch-vm 迁移到系统原生 JavaScriptCore 运行。iOS 独立
+///   JSContext 被禁用 JIT（比 WKWebView 里的 JS 更慢），且缺 DOM/Canvas/WebGL/
+///   WebAudio/Worker 等浏览器 API，无法承载完整 VM。此开关是面向未来的完整闭环
+///   与预留接口，不改变 VM 运行载体。
+///
 /// 关键稳定性修正（针对 iPhone 7 / 老设备启动闪退）：
 /// - WKWebView 仅创建一次，避免复用 WKWebViewConfiguration 引发异常崩溃。
 /// - index.html 查找多重回退，失败不再 fatalError，而是弹错误提示。
@@ -37,6 +47,10 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     private(set) var webView: WKWebView?
     private var indexURL: URL?
     private var scratchDir: URL?
+    /// 当前已加载作品的 data: URL 字符串（无作品时为 nil）。
+    /// 只保存数据本身，重载时由 makeAppURL 从干净的 indexURL 重新拼装，
+    /// 避免对超长 data: URL 做 URLComponents 往返导致二次编码破坏 project_url。
+    private var currentProjectDataURL: String?
 
     /// 「从电脑中打开」：文件选择器回调（runOpenPanelWith / scratchOpen 消息两条路径），
     /// 选中/取消后必须调用一次把结果回传 WebKit（JS 拦截路径无网页回调，回传 nil 无害）。
@@ -66,6 +80,66 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
                 }
             }
         }
+    }
+
+    // MARK: - 「使用原生级快速引擎」开关（持久化 / URL / 注入）
+
+    /// UserDefaults 键：开关为跨会话持久化（nonPersistent dataStore 不保存 localStorage）。
+    private static let fastEngineKey = "gudao.fastEngineEnabled"
+
+    /// 读取开关状态；首次（未写入过）默认关闭。
+    private var fastEngineEnabled: Bool {
+        UserDefaults.standard.object(forKey: ScratchBridge.fastEngineKey) as? Bool ?? false
+    }
+
+    /// 写入开关状态。
+    private func setFastEngineEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: ScratchBridge.fastEngineKey)
+    }
+
+    /// atDocumentStart 注入的固定片段（内容恒定，不随开关变化，避免重建 WKUserScript）：
+    /// 运行时从 URL query 读取 fastEngine 标志写入 window.__fastEngineEnabled。
+    /// 用正则而非 URLSearchParams，兼容 iOS 13 且不依赖 history.replaceState 后的 URL。
+    private static let fastEngineBootstrapJS =
+        "\nwindow.__fastEngineEnabled = /(?:^|[?&])fastEngine=1(?:&|$)/.test(window.location.search);"
+
+    /// 从干净的 indexURL 拼装 App 加载 URL：移除既有的 project_url / fastEngine，
+    /// 再按当前状态重新附上（project_url 仅在打开作品时传入，fastEngine 恒带）。
+    /// 始终以 indexURL（不含 query）为基准，避免对超长 data: 作品 URL 做 URLComponents 往返。
+    /// makeWebView 首屏、openProject 载入作品、开关切换重载三处共用。
+    private func makeAppURL(projectDataURL: String?) -> URL? {
+        guard let indexURL = indexURL else { return nil }
+        guard var components = URLComponents(url: indexURL, resolvingAgainstBaseURL: false) else {
+            return indexURL
+        }
+        var items = (components.queryItems ?? []).filter {
+            $0.name != "fastEngine" && $0.name != "project_url"
+        }
+        if let projectDataURL = projectDataURL {
+            items.append(URLQueryItem(name: "project_url", value: projectDataURL))
+        }
+        items.append(URLQueryItem(name: "fastEngine", value: fastEngineEnabled ? "1" : "0"))
+        components.queryItems = items
+        return components.url ?? indexURL
+    }
+
+    /// didFinish 时以 UserDefaults 权威值回推，兜底任何 history.replaceState 导致的 URL 漂移。
+    private func pushFastEngineState(to webView: WKWebView) {
+        let js = "window.__fastEngineEnabled = \(fastEngineEnabled);"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// 应用开关切换：持久化 → 重拼 URL（保留 project_url）→ 重新加载作品。
+    /// 重载由原生层主导，避免 postMessage 异步与网页 location.reload() 的竞态。
+    /// 调用方需在 DispatchQueue.main 上执行（WKScriptMessageHandler 回调不保证主线程）。
+    private func applyFastEngine(_ enabled: Bool) {
+        // 同值去重，避免连点触发多次重载。
+        guard enabled != fastEngineEnabled else { return }
+        setFastEngineEnabled(enabled)
+        guard let webView = webView, let scratchDir = scratchDir,
+              let url = makeAppURL(projectDataURL: currentProjectDataURL) else { return }
+        showToast("设置已更新，正在重新加载作品（未保存的修改会丢失）", isError: false)
+        webView.loadFileURL(url, allowingReadAccessTo: scratchDir)
     }
 
     // MARK: - WebView 创建与加载
@@ -103,12 +177,17 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         // 追加用户下载资产清单（window.__scratchUserAssets）：本地资源无论联网与否一律优先。
         configuration.userContentController.addUserScript(
             WKUserScript(
-                source: ScratchBridge.bundledAssetsJS + userAssetsInjectionJS(),
+                // 追加固定片段：把 fastEngine 开关标志写入 window.__fastEngineEnabled。
+                // 片段内容恒定，开关切换无需重建 WKUserScript。
+                source: ScratchBridge.bundledAssetsJS + userAssetsInjectionJS() +
+                    ScratchBridge.fastEngineBootstrapJS,
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: false
             )
         )
         configuration.userContentController.add(self, name: "scratchSave")
+        // 「使用原生级快速引擎」：网页设置弹窗切换开关时上报到此。
+        configuration.userContentController.add(self, name: "fastEngine")
         // 资源离线包：网页把待下载资产清单上报到此，由原生 URLSession 下载（规避 CORS）
         // 写入 Documents 沙盒并回推 hydrate；启动时再回推离线状态。
         configuration.userContentController.add(self, name: "offlineDownload")
@@ -122,7 +201,9 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
         webView.allowsBackForwardNavigationGestures = false
         webView.scrollView.bounces = false
         self.webView = webView
-        webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
+        // 首屏无作品：URL 仅附带 fastEngine 标志（供 atDocumentStart 注入初值）。
+        let initialURL = makeAppURL(projectDataURL: nil) ?? indexURL
+        webView.loadFileURL(initialURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
         return webView
     }
 
@@ -154,14 +235,13 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
     /// scratch-gui 的编辑器仅从 URL 读取 project_url（支持 http/https/data 三种 scheme），
     /// 因此用 `data:application/octet-stream;base64,<内容>` 直接传入，无需本地 HTTP server。
     func openProject(data: Data) {
-        guard let indexURL = indexURL, let scratchDir = scratchDir else { return }
+        guard let scratchDir = scratchDir else { return }
         let base64 = data.base64EncodedString()
         let dataURL = "data:application/octet-stream;base64," + base64
-        guard var components = URLComponents(url: indexURL, resolvingAgainstBaseURL: false) else { return }
-        components.queryItems = [URLQueryItem(name: "project_url", value: dataURL)]
-        if let url = components.url {
-            webView?.loadFileURL(url, allowingReadAccessTo: scratchDir)
-        }
+        guard let url = makeAppURL(projectDataURL: dataURL) else { return }
+        // 记录作品数据本身，供之后「快速引擎」开关切换时重新加载同一作品。
+        self.currentProjectDataURL = dataURL
+        webView?.loadFileURL(url, allowingReadAccessTo: scratchDir)
     }
 
     /// 「从电脑中打开」路径 2（iOS 18.4+ 系统兜底）：WKWebView 的文件输入支持自
@@ -258,6 +338,21 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
             DispatchQueue.main.async { [weak self] in
                 self?.presentProjectPicker()
             }
+        case "fastEngine":
+            // 「使用原生级快速引擎」开关切换：主线程派发后持久化并重新加载作品
+            //（WKWebView 操作必须在主线程）。JS boolean 通常桥接为 Bool，
+            // 少数系统版本桥接为 NSNumber，二者都兼容。
+            let enabled: Bool
+            if let b = body?["enabled"] as? Bool {
+                enabled = b
+            } else if let n = body?["enabled"] as? NSNumber {
+                enabled = n.boolValue
+            } else {
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.applyFastEngine(enabled)
+            }
         default:
             break
         }
@@ -267,6 +362,8 @@ final class ScratchBridge: NSObject, ObservableObject, WKScriptMessageHandler, W
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pushOfflineState(to: webView)
+        // 以 UserDefaults 权威值回推开关键，兜底 history.replaceState 造成的 URL 漂移。
+        pushFastEngineState(to: webView)
     }
 
     // MARK: - WKNavigationDelegate（加载错误兜底）

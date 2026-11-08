@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
     <head>
-        <title>TurboWarp Privacy Policy</title>
+        <title>Gudaocode 隐私政策</title>
         <meta charset="utf8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {
-                font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+                font-family: "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
                 margin: 0; padding: 0;
             }
             header {
@@ -18,6 +18,16 @@
             main {
                 max-width: 600px;
                 margin: auto;
+                padding: 0 16px 24px;
+            }
+            h2 {
+                margin-top: 28px;
+            }
+            h3 {
+                margin-bottom: 4px;
+            }
+            ul {
+                padding-left: 20px;
             }
             @media (prefers-color-scheme: dark) {
                 body { background: #111; color: #eee; }
@@ -28,97 +38,49 @@
 
     <body>
         <header>
-            <h1>TurboWarp Privacy Policy</h1>
+            <h1>Gudaocode 隐私政策</h1>
         </header>
 
         <main>
-            <!-- UPDATE THIS WHEN MAKING CONTENT CHANGES -->
-            <p><i>Updated September 27, 2025</i></p>
+            <p><i>生效日期：2026 年 10 月 31 日</i></p>
 
-            <p>The TurboWarp project respects your privacy. We're an open source project ran by volunteers. For transparency, this page lists all the places in TurboWarp where we or a third-party receive your data and how your data is handled.</p>
+            <p>Gudaocode 是一款面向编程学习与创作的工具应用，由开发者陈丹萍运营。我们尊重并保护用户的隐私。本隐私政策说明 Gudaocode 在运行过程中如何处理您的数据，帮助您了解我们收集了什么、如何使用以及如何管理。</p>
 
-            <h2>Abuse</h2>
-            <p>When a service is being abused, we may take measures to collect information to protect the service. For example, we could log IP addresses making excessive amounts of requests. We strive to do this carefully so that no one is caught in the crossfire. Data is kept only as long as needed to stop the abuse.</p>
+            <h2>我们收集和处理的信息</h2>
+            <p>在默认情况下，Gudaocode <strong>不收集任何可识别个人身份的信息</strong>（如姓名、电话号码、电子邮件、精确位置、设备标识符等）。我们仅在以下两类情形下处理数据：</p>
 
-            <h2>turbowarp.org</h2>
-            <p>A randomly generated username may be saved in your browser. You can replace this with a custom username. Randomly generated usernames are anonymized by removing the random numbers before being sent to any cloud variable server.</p>
-            <p>When you start a project that is loaded from Scratch, this may be logged so that a view counter can be incremented over time. Views are anonymous and can not be tied back to any user. You can prevent your views from being counted by unchecking the box below. This checkbox will not affect your ability to see view counts.</p>
-            <p>
-                <label>
-                    <input type="checkbox" class="windchimes-optout">
-                    Allow counting my views
-                </label>
-            </p>
-            <script>
-                (function() {
-                    const isOptedOut = () => {
-                        try {
-                            const local = localStorage.getItem('tw:windchime_opt_out');
-                            if (local !== null) {
-                                return local === 'true';
-                            }
-                        } catch (e) {
-                            // ignore
-                        }
-                        // These headers are really intended to be about third-parties so we don't need to follow them,
-                        // but if someone has these set, it's good to assume that they would opt out if given the choice.
-                        // So we'll just respect that preemptively.
-                        return navigator.globalPrivacyControl === 'true' || navigator.doNotTrack === '1';
-                    };
-                    const setOptedOut = optedOut => {
-                        try {
-                            localStorage.setItem('tw:windchime_opt_out', optedOut);
-                        } catch (e) {
-                            // ignore
-                        }
-                    };
-                    const checkbox = document.querySelector('.windchimes-optout');
-                    checkbox.checked = !isOptedOut();
-                    checkbox.addEventListener('change', (e) => {
-                        setOptedOut(!e.target.checked);
-                    });
-                })();
-            </script>
+            <h3>1. 本地作品的存储与读取</h3>
+            <p>为了实现"保存 / 读取本地作品"的功能，应用会在<strong>您的设备本地</strong>存储您创作的 Scratch 项目数据（包括脚本、造型、声音等信息）。这些数据仅保存在本机，用于您在应用内再次打开、编辑和读取。</p>
+            <p>除非您主动执行分享、导出或上传等操作，否则本地作品不会被发送至我们的服务器，也不会被我们收集。</p>
 
-            <h2>Loading projects</h2>
-            <p>When you load a project from another website, you are subject to the privacy practices of that website. For example, when loading projects from Scratch, you are subject to the <a href="https://scratch.mit.edu/privacy_policy">Scratch privacy policy</a>. When loading projects from Scratch specifically, the project ID will also be shared with TurboWarp as part of Scratch's API does not allow direct access. We may briefly log the project ID for caching.</p>
+            <h3>2. 自定义拓展的第三方网络请求</h3>
+            <p>应用的联网功能<strong>仅用于自定义拓展向第三方网址发起网络请求</strong>。当您加载并使用某个自定义拓展时，应用会按照该拓展的设定，向拓展指定的第三方服务器发送请求；请求的具体内容与返回结果由拓展的提供方及您的使用行为决定。我们不会借助该功能预设或额外收集您的个人信息。</p>
+            <p>加载自定义拓展时，应用会弹出安全提示，明确告知该拓展将要连接的网址，由您决定是否允许。相关请求的数据由对应的第三方处理，适用该第三方的隐私政策。</p>
 
-            <h2>Cloud variables</h2>
-            <p>When connecting to our cloud variable servers, the project ID and username may be logged for 14 days. Data in cloud variables is public and sent to anyone else connected at the same time. Custom cloud variable servers are outside of our control.</p>
+            <h2>第三方链接与外部跳转</h2>
+            <p>应用内的部分链接会跳转到第三方网站。此类跳转会经您确认后，由系统浏览器打开；跳转后的内容由对应网站提供，适用该网站的隐私政策。</p>
 
-            <h2>Extensions</h2>
-            <p>Some extensions must communicate with external APIs to function. For example, the translate and text-to-speech extensions rely on the Scratch API, which is covered by the <a href="https://scratch.mit.edu/privacy_policy">Scratch privacy policy</a>. To improve performance, some extensions access TurboWarp's APIs instead where both the request (for example, the text being translated) and the result after forwarding to Scratch (for example, the translated version of the text) may be cached.</p>
-            <p>Most extensions on the <a href="https://extensions.turbowarp.org/">official extension gallery</a> will ask for permission when the project attempts to use the extension to access an untrusted website, however we cannot guarantee this is 100% reliable.</p>
-            <p>When loading a custom extension from a place other than the official gallery such as a URL or file on your computer, the editor will ask for permission to load the extension. If you approve this dialog, the extension can bypass the permission dialogs that official extensions show.</p>
+            <h2>数据存储与安全</h2>
+            <p>您的作品数据主要保存在设备本地，应用不会在未经您同意的情况下将其上传。请您注意妥善保管设备，避免他人接触您的本地作品。</p>
+            <p>若您使用自定义拓展发起第三方网络请求，相关数据传输受该第三方的安全机制约束，请您在使用前了解对应拓展的来源与可信度。</p>
 
-            <h2>Settings</h2>
-            <p>Many TurboWarp websites will store settings such as <a href="https://turbowarp.org/addons">addon settings</a> or <a href="https://packager.turbowarp.org/">packager settings</a> in your browser.</p>
+            <h2>未成年人保护</h2>
+            <p>Gudaocode 面向编程学习与创作，建议未成年人在监护人的指导下使用。根据相关法律法规，不满 14 周岁的未成年人，其个人信息的处理需取得监护人同意；我们建议监护人协助未成年人阅读本政策，并监督其使用行为。</p>
 
-            <h2>Aggregated data</h2>
-            <p>We may log anonymous aggregated data such as how many people use a certain site per day.</p>
+            <h2>您的权利</h2>
+            <p>由于作品数据均保存在您的设备本地，您可以通过以下方式管理自己的数据：</p>
+            <ul>
+                <li>在应用内删除或导出您的本地作品；</li>
+                <li>通过系统「设置 → 应用 → Gudaocode → 清除数据 / 存储空间」，一次性清除所有本地作品与缓存。</li>
+            </ul>
 
-            <h2>TurboWarp Desktop</h2>
-            <p><a href="https://desktop.turbowarp.org/">TurboWarp Desktop</a> may make requests to check for updates. This can be disabled by pressing "Settings" then "Desktop Settings".</p>
-            <p><a href="https://desktop.turbowarp.org/">TurboWarp Desktop</a> has a disabled-by-default option to enable "Rich Presence" which shares the name of the project you have open and how long it has been open with chat apps running on your computer, which may be displayed on your public profile. This can be disabled by pressing "Settings" then "Desktop Settings".</p>
+            <h2>服务器与跨境说明</h2>
+            <p>本应用的服务器部署于海外。由于我们在默认情况下不收集可识别个人的信息，因此不存在个人信息的跨境传输；前述联网行为仅限于自定义拓展对第三方网址的功能性请求。</p>
 
-            <h2>docs.turbowarp.org</h2>
-            <p>The search bar is provided by Algolia. See the <a href="https://www.algolia.com/policies/privacy/">Algolia privacy policy</a>.</p>
+            <h2>联系我们</h2>
+            <p>如您对本隐私政策或数据处理有任何疑问，请联系：Gudao2112332233@163.com</p>
 
-            <h2>TurboWarp Packager</h2>
-            <p>The <a href="https://packager.turbowarp.org/">TurboWarp Packager</a> may store settings and cache large downloads such as Electron in your browser for convenience and performance.</p>
-            <p>When packaging a project using custom extensions, the packager may access those websites to download the extensions.</p>
-
-            <h2>Projects generated by the TurboWarp Packager</h2>
-            <p>Packaged projects include all scripts, costumes, and sounds to run the project. The packager tries to include all custom extensions too, but in some cases, the packaged project may need to download certain extensions each time it runs.</p>
-            <p>Advanced features such as third-party custom extensions, custom cloud host, custom JS, and custom CSS are outside of our control.</p>
-            <p>Note that, unlike the TurboWarp editor, custom extensions in packaged projects will not ask for permission before contacting websites.</p>
-            <p>You are responsible for informing end users about the privacy practices of the files you distribute. Do not link to this document as your project's privacy policy as it may change in the future. You must write your own.</p>
-
-            <h2>TurboWarp Packager Extras</h2>
-            <p><a href="https://github.com/TurboWarp/packager-extras/releases">TurboWarp Packager Extras</a> may make requests to check for updates.</p>
-
-            <h2>Contact</h2>
-            <p>Any concerns related to privacy or any other matter should be sent to: <a href="mailto:contact@turbowarp.org">contact@turbowarp.org</a></p>
+            <p><i>本隐私政策可能不时更新，更新后的版本将以本页面所示生效日期为准。</i></p>
         </main>
     </body>
 </html>
